@@ -53,6 +53,11 @@ _no_unused_variable = select({
     "//conditions:default": ["-Wno-unused-variable"],
 })
 
+_no_unused_variable_no_parentheses = select({
+    ":compiler_is_msvc": [],
+    "//conditions:default": ["-Wno-unused-variable -Wno-parentheses"],
+})
+
 td_library(
     name = "td_files",
     srcs = glob(["include/triton/**/*.td"]),
@@ -350,6 +355,7 @@ cc_library(
     name = "TritonTransforms",
     srcs = glob(["lib/Dialect/Triton/Transforms/*.cpp"]),
     hdrs = glob(["include/triton/Dialect/Triton/Transforms/*.h"]),
+    copts = ["-Wno-parentheses"],
     includes = ["include"],
     deps = [
         ":TritonDialects",
@@ -413,7 +419,7 @@ cc_library(
         "include/triton/Tools/Sys/*.hpp",
         "include/triton/Conversion/TritonGPUToLLVM/*.h",
     ]),
-    copts = _no_unused_variable,
+    copts = _no_unused_variable_no_parentheses,
     includes = [
         "include",
         "lib/Conversion/TritonGPUToLLVM",
