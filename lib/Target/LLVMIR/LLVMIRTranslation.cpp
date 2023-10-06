@@ -2,7 +2,6 @@
 #include "LLVMPasses.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/IndexToLLVM/IndexToLLVM.h"
-#include "mlir/Conversion/Passes.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/Transforms/Passes.h"
@@ -255,19 +254,6 @@ static std::map<std::string, std::string> getExternLibs(mlir::ModuleOp module) {
     if (func.isExternal())
       funcs.push_back(func);
   });
-
-  for (LLVM::LLVMFuncOp func : funcs) {
-    if (auto libnameAttr = func->getDiscardableAttr("libname")) {
-      auto name = libnameAttr.dyn_cast<StringAttr>();
-      auto path = func.getOperation()
-                      ->getDiscardableAttr("libpath")
-                      .dyn_cast<StringAttr>();
-      if (name) {
-        std::string libName = name.str();
-        externLibs[libName] = path.str();
-      }
-    }
-  }
 
   if (auto externsAttr = module->getDiscardableAttr("triton_gpu.externs")) {
     for (auto &attr : externsAttr.cast<DictionaryAttr>()) {
