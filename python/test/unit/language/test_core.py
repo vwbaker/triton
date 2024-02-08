@@ -2024,11 +2024,11 @@ layouts = [
     MmaLayout(version=(2, 0), warps_per_cta=[2, 2], ctas_per_cga=[1, 1], cta_split_num=[1, 1], cta_order=[0, 1],
               instr_shape=[16, 8]),
     MmaLayout(version=(3, 0), warps_per_cta=[4, 2], ctas_per_cga=[1, 1], cta_split_num=[1, 1], cta_order=[1, 0],
-              instr_shape=[16, 16, 16]),
+              instr_shape=[16, 32, 16]),
 ]
 
 
-@pytest.mark.parametrize("M, N", [[128, 16], [128, 128], [32, 128], [32, 32]])
+@pytest.mark.parametrize("M, N", [[128, 16], [128, 128], [32, 128], [32, 32], [64, 64]])
 @pytest.mark.parametrize("src_layout", layouts)
 @pytest.mark.parametrize("axis", [0, 1])
 @pytest.mark.parametrize("reduce2d", [False, True])
