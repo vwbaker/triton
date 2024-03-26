@@ -2418,10 +2418,18 @@ layouts = [
               instr_shape=[16, 8]),
     MmaLayout(version=(3, 0), warps_per_cta=[4, 1], ctas_per_cga=[1, 1], cta_split_num=[1, 1], cta_order=[1, 0],
               instr_shape=[16, 16, 16]),
+    # Run: pytest test/unit/language/test_core.py -vvv -k \
+    # 'test_reduce_layouts[max-float16-False-0-src_layout7-64-64]'
+    MmaLayout(version=(3, 0), warps_per_cta=[4, 2], ctas_per_cga=[1, 1], cta_split_num=[1, 1], cta_order=[1, 0],
+              instr_shape=[16, 32, 16]),
+    # Run: pytest test/unit/language/test_core.py -vvv -k \
+    # 'test_reduce_layouts[sum-float32-False-0-src_layout8-64-64]'
+    MmaLayout(version=(3, 0), warps_per_cta=[4, 2], ctas_per_cga=[1, 1], cta_split_num=[1, 1], cta_order=[1, 0],
+              instr_shape=[16, 32, 8]),
 ]
 
 
-@pytest.mark.parametrize("M, N", [[128, 16], [128, 128], [32, 128], [32, 32], [16, 16]])
+@pytest.mark.parametrize("M, N", [[128, 16], [128, 128], [32, 128], [32, 32], [16, 16], [64, 64]])
 @pytest.mark.parametrize("src_layout", layouts)
 @pytest.mark.parametrize("axis", [0, 1])
 @pytest.mark.parametrize("epilogue_kind", ['reduce1d', 'reduce2d', 'expand_reduce2d'])
@@ -2445,7 +2453,7 @@ def test_reduce_layouts(M, N, src_layout, axis, epilogue_kind, dtype_str, reduce
     rdims_1d = f"{N}" if axis == 0 else f"{M}"
     rdims_2d = f"1x{N}" if axis == 0 else f"{M}x1"
     store_range = "%7" if axis == 0 else "%1"
-    blocked = BlockedLayout([1, 1], [32, 1], [4, 1], [0, 1], [1, 1], [1, 1], [0, 1])
+    blocked = BlockedLayout([1, 1], [32, 1], [4, 2], [0, 1], [1, 1], [1, 1], [0, 1])
     one_d_layout = BlockedLayout([1], [32], [4], [0], [1], [1], [0])
     expanded_shape = f"1x{N}" if axis == 0 else f"{M}x1"
     other_axis = 1 - axis
@@ -2492,7 +2500,7 @@ def test_reduce_layouts(M, N, src_layout, axis, epilogue_kind, dtype_str, reduce
     #blocked = {blocked}
     #src = {src_layout}
     #one_d_layout = {one_d_layout}
-    module attributes {{"triton_gpu.num-warps" = 4 : i32, "triton_gpu.num-ctas" = 1 : i32, "triton_gpu.threads-per-warp" = 32 : i32}} {{
+    module attributes {{"triton_gpu.num-warps" = 8 : i32, "triton_gpu.num-ctas" = 1 : i32, "triton_gpu.threads-per-warp" = 32 : i32}} {{
     tt.func public @kernel_0d1d2c3d4c(%arg0: !tt.ptr<{ty}, 1> {{tt.divisibility = 16 : i32}}, %arg1: i32 {{tt.divisibility = 16 : i32}}, %arg2: !tt.ptr<{ty}, 1> {{tt.divisibility = 16 : i32}}) {{
         %0 = tt.make_range {{end = {M} : i32, start = 0 : i32}} : tensor<{M}xi32, #{GPU_DIALECT}.slice<{{dim = 1, parent = #blocked}}>>
         %1 = tt.expand_dims %0 {{axis = 1 : i32}} : tensor<{M}xi32, #{GPU_DIALECT}.slice<{{dim = 1, parent = #blocked}}>> -> tensor<{M}x1xi32, #blocked>
