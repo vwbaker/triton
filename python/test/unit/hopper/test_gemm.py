@@ -251,6 +251,7 @@ def matmul_kernel(a_ptr, b_ptr, w_ptr, bias_ptr, z_ptr,  #
             [128, 128, 64, 4, 1, None, None, None],
             [16, 16, 64, 4, 1, 16, 16, 64],
             [64, 64, 32, 8, 1, 64, 64, 64],
+            [64, 512, 32, 8, 1, 64, 64, 64], # evil.
             [128, 128, 64, 4, 1, 128, 128, 128],
         ] for epilogue in ['softmax'] for out_dtype in ['float16', 'float32'] for use_tma_store in [False, True] for
         trans_a in [False] for trans_b in [True] for trans_output in [False] for num_stages in [3]
@@ -433,8 +434,15 @@ def test_gemm(BLOCK_M, BLOCK_N, BLOCK_K, NUM_WARPS, NUM_CTAS, M, N, K, TRANS_A, 
         num_warps=NUM_WARPS, num_ctas=NUM_CTAS, num_stages=NUM_STAGES)
 
     torch.set_printoptions(profile="full")
-    golden = torch.nn.functional.normalize(golden)
-    z = torch.nn.functional.normalize(z)
+    if epilogue == 'softmax':
+        bad_values = z[(z > 1)]
+        print(f"\nGot {bad_values.size(dim=0)} values > 1: {bad_values}")
+        negative_values = z[(z < 0)]
+        print(f"Got {negative_values.size(dim=0)} negative values: {negative_values}")
+
+    #golden = torch.nn.functional.normalize(golden)
+    #z = torch.nn.functional.normalize(z)
+
     assert_close(z, golden, rtol=1e-2, atol=1e-3, check_dtype=False)
 
     disable_mmav3 = os.environ.get('DISABLE_MMA_V3', 'not found').lower()
