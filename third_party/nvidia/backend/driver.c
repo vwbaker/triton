@@ -794,12 +794,12 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
     return NULL;
   }
   // extract launch metadata
-  // if (launch_enter_hook != Py_None){
-  //   PyObject* ret = PyObject_CallOneArg(launch_enter_hook, launch_metadata);
-  //   if (!ret)
-  //     return NULL;
-  //   Py_DECREF(ret);
-  // }
+  if (launch_enter_hook != Py_None) {
+    PyObject *ret = PyObject_CallOneArg(launch_enter_hook, launch_metadata);
+    if (!ret)
+      return NULL;
+    Py_DECREF(ret);
+  }
 
   // Extract args.
   PyObject *fast_kernel_arg_types = PySequence_Fast(
@@ -831,15 +831,20 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   for (Py_ssize_t i = 0; i < num_args; ++i) {
     PyObject *type_repr = PyObject_Repr(kernel_types_data[i]);
     if (!type_repr) {
-      return NULL;
+      Py_DECREF(type_repr);
+      goto cleanup;
     }
     PyObject *type_str = PyUnicode_AsEncodedString(type_repr, "utf-8", "~E~");
     if (!type_str) {
-      return NULL;
+      Py_DECREF(type_repr);
+      Py_DECREF(type_str);
+      goto cleanup;
     }
     const char *type_bytes = PyBytes_AsString(type_str);
     if (!type_bytes) {
-      return NULL;
+      Py_DECREF(type_repr);
+      Py_DECREF(type_str);
+      goto cleanup;
     }
     fprintf(stderr, "arg type: '%s'\n", type_bytes);
     // type_bytes[0] is always '
@@ -847,6 +852,8 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
       params[params_idx] = alloca(sizeof(CUdeviceptr));
       fprintf(stderr, "is pointer\n");
       if (!extractPointer(params[params_idx++], kernel_args_data[i])) {
+        Py_DECREF(type_repr);
+        Py_DECREF(type_str);
         return NULL;
       }
     } else if (strcmp(type_bytes, "'i8'") == 0) {
@@ -895,6 +902,8 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
     } else {
       fprintf(stderr, "ahhhhhhhhhh what is this?\n");
     }
+    Py_DECREF(type_repr);
+    Py_DECREF(type_str);
   }
   params[params_idx] = alloca(sizeof(void *));
   if (!extractPointer(params[params_idx++], global_scratch_obj)) {
@@ -914,13 +923,16 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
     return NULL;
   }
 
-  // if(launch_exit_hook != Py_None){
-  //   PyObject* ret = PyObject_CallOneArg(launch_exit_hook, launch_metadata);
-  //   if (!ret)
-  //     return NULL;
-  //   Py_DECREF(ret);
-  // }
+  if (launch_exit_hook != Py_None) {
+    PyObject *ret = PyObject_CallOneArg(launch_exit_hook, launch_metadata);
+    if (!ret)
+      return NULL;
+    Py_DECREF(ret);
+  }
 
+cleanup:
+  Py_DECREF(fast_kernel_arg_types);
+  Py_DECREF(fast_kernel_args);
   Py_RETURN_NONE;
 }
 
