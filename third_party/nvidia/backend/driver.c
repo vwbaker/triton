@@ -30,6 +30,12 @@ static bool gpuAssert(CUresult code, const char *file, int line) {
 }
 
 // To be used only *outside* a Py_{BEGIN,END}_ALLOW_THREADS block.
+#define CUDA_CHECK(ans)                                                        \
+  {{gpuAssert((ans), __FILE__, __LINE__);                                      \
+  }                                                                            \
+  }
+
+// To be used only *outside* a Py_{BEGIN,END}_ALLOW_THREADS block.
 #define CUDA_CHECK_AND_RETURN_NULL(ans)                                        \
   do {                                                                         \
     if (!gpuAssert((ans), __FILE__, __LINE__))                                 \
@@ -477,6 +483,442 @@ cleanup:
   return NULL;
 }
 
+static void ensureCudaContext() {
+  CUcontext pctx;
+  CUDA_CHECK(cuCtxGetCurrent(&pctx));
+  if (!pctx) {
+    // Ensure device context.
+    CUdevice device;
+    CUDA_CHECK(cuDeviceGet(&device, 0));
+    CUDA_CHECK(cuDevicePrimaryCtxRetain(&pctx, device));
+    CUDA_CHECK(cuCtxSetCurrent(pctx));
+  }
+}
+
+typedef CUresult (*cuLaunchKernelEx_t)(const CUlaunchConfig *config,
+                                       CUfunction f, void **kernelParams,
+                                       void **extra);
+
+static cuLaunchKernelEx_t getLaunchKernelExHandle() {
+  // Open the shared library
+  void *handle = dlopen("libcuda.so.1", RTLD_LAZY);
+  if (!handle) {
+    PyErr_SetString(PyExc_RuntimeError, "Failed to open libcuda.so.1");
+    return NULL;
+  }
+  // Clear any existing error
+  dlerror();
+  cuLaunchKernelEx_t cuLaunchKernelExHandle =
+      (cuLaunchKernelEx_t)dlsym(handle, "cuLaunchKernelEx");
+  // Check for errors
+  const char *dlsym_error = dlerror();
+  if (dlsym_error) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "Failed to retrieve cuLaunchKernelEx from libcuda.so.1");
+    return NULL;
+  }
+  return cuLaunchKernelExHandle;
+}
+
+static void _launch(int gridX, int gridY, int gridZ, int num_warps,
+                    int num_ctas, int launch_cooperative_grid, int launch_pdl,
+                    int shared_memory, CUstream stream, CUfunction function,
+                    CUdeviceptr global_scratch, CUdeviceptr profile_scratch,
+                    void **params) {
+  if (gridX * gridY * gridZ > 0) {
+    // 4 attributes that we can currently pass maximum
+    CUlaunchAttribute launchAttr[4];
+    static cuLaunchKernelEx_t cuLaunchKernelExHandle = NULL;
+    if (cuLaunchKernelExHandle == NULL) {
+      cuLaunchKernelExHandle = getLaunchKernelExHandle();
+    }
+    CUlaunchConfig config;
+    config.gridDimX = gridX * num_ctas;
+    config.gridDimY = gridY;
+    config.gridDimZ = gridZ;
+
+    config.blockDimX = 32 * num_warps;
+    config.blockDimY = 1;
+    config.blockDimZ = 1;
+    config.sharedMemBytes = shared_memory;
+    config.hStream = stream;
+    config.attrs = launchAttr;
+    int num_attrs = 0;
+
+    if (launch_pdl != 0) {
+      CUlaunchAttribute pdlAttr = {
+          .id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION,
+          .value = 1};
+      launchAttr[num_attrs] = pdlAttr;
+      ++num_attrs;
+    }
+
+    if (launch_cooperative_grid != 0) {
+      CUlaunchAttribute coopAttr = {.id = CU_LAUNCH_ATTRIBUTE_COOPERATIVE,
+                                    .value = 1};
+      launchAttr[num_attrs] = coopAttr;
+      ++num_attrs;
+    }
+
+    if (num_ctas != 1) {
+      CUlaunchAttribute clusterAttr = {};
+      clusterAttr.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+      clusterAttr.value.clusterDim.x = num_ctas;
+      clusterAttr.value.clusterDim.y = 1;
+      clusterAttr.value.clusterDim.z = 1;
+      launchAttr[num_attrs] = clusterAttr;
+      ++num_attrs;
+
+      CUlaunchAttribute clusterSchedulingAttr = {};
+      clusterSchedulingAttr.id =
+          CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE;
+      clusterSchedulingAttr.value.clusterSchedulingPolicyPreference =
+          CU_CLUSTER_SCHEDULING_POLICY_SPREAD;
+      launchAttr[num_attrs] = clusterSchedulingAttr;
+      ++num_attrs;
+    }
+
+    // num_ctas == 16 is non-portable. Does work for H100 and B200 tho
+    config.numAttrs = num_attrs;
+    if (num_ctas == 16) {
+      CUDA_CHECK(cuFuncSetAttribute(
+          function, CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 1));
+    }
+
+    CUDA_CHECK(cuLaunchKernelExHandle(&config, function, params, 0));
+  }
+}
+
+typedef struct _DevicePtrInfo {
+  CUdeviceptr dev_ptr;
+  bool valid;
+} DevicePtrInfo;
+
+static PyObject *data_ptr_str = NULL;
+static PyObject *py_tensor_map_type = NULL;
+
+static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {
+  DevicePtrInfo ptr_info;
+  ptr_info.dev_ptr = 0;
+  ptr_info.valid = true;
+  if (PyLong_Check(obj)) {
+    ptr_info.dev_ptr = PyLong_AsUnsignedLongLong(obj);
+    return ptr_info;
+  }
+  if (obj == Py_None) {
+    // valid nullptr
+    return ptr_info;
+  }
+  PyObject *ret = PyObject_CallMethodNoArgs(obj, data_ptr_str);
+  if (!ret) {
+    PyErr_SetString(
+        PyExc_TypeError,
+        "Pointer argument must be either uint64 or have data_ptr method");
+    ptr_info.valid = false;
+    goto cleanup;
+  }
+  if (!PyLong_Check(ret)) {
+    PyErr_SetString(PyExc_TypeError,
+                    "data_ptr method of Pointer object must return 64-bit int");
+    ptr_info.valid = false;
+    goto cleanup;
+  }
+  ptr_info.dev_ptr = PyLong_AsUnsignedLongLong(ret);
+  if (!ptr_info.dev_ptr)
+    return ptr_info;
+  uint64_t dev_ptr;
+  int status = cuPointerGetAttribute(
+      &dev_ptr, CU_POINTER_ATTRIBUTE_DEVICE_POINTER, ptr_info.dev_ptr);
+  if (status == CUDA_ERROR_INVALID_VALUE) {
+    PyErr_Format(
+        PyExc_ValueError,
+        "Pointer argument (at %d) cannot be accessed from Triton (cpu tensor?)",
+        idx);
+    ptr_info.valid = false;
+  } else if (status != CUDA_SUCCESS) {
+    CUDA_CHECK(status); // Catch any other cuda API errors
+    ptr_info.valid = false;
+  }
+  ptr_info.dev_ptr = dev_ptr;
+cleanup:
+  Py_XDECREF(ret);
+  return ptr_info;
+}
+
+// Extract a CUDA device pointer from a pointer-like PyObject obj, and store
+// it to the memory location pointed by ptr.
+inline bool extractPointer(void *ptr, PyObject *obj) {
+  fprintf(stderr, "start of extract ptr\n");
+  CUdeviceptr *dev_ptr = ptr;
+  if (obj == Py_None) {
+    *dev_ptr = (CUdeviceptr)0; // valid nullptr
+    return true;
+  }
+  if (PyLong_Check(obj)) {
+    *dev_ptr = PyLong_AsUnsignedLongLong(obj);
+    return true;
+  }
+  PyObject *data_ptr = PyObject_GetAttrString(obj, "data_ptr");
+  if (!data_ptr) {
+    PyErr_Format(PyExc_TypeError,
+                 "Pointer argument must be either uint64 or have data_ptr "
+                 "method, but got %R",
+                 obj);
+    return false;
+  }
+  PyObject *empty_tuple = PyTuple_New(0);
+  PyObject *ret = PyObject_Call(data_ptr, empty_tuple, NULL);
+  if (!PyLong_Check(ret)) {
+    PyErr_SetString(PyExc_TypeError,
+                    "data_ptr method of Pointer object must return 64-bit int");
+    return false;
+  }
+  *dev_ptr = PyLong_AsUnsignedLongLong(ret);
+  if (*dev_ptr == 0) {
+    return true; // valid nullptr
+  }
+  CUresult status = cuPointerGetAttribute(
+      dev_ptr, CU_POINTER_ATTRIBUTE_DEVICE_POINTER, *dev_ptr);
+  if (status == CUDA_ERROR_INVALID_VALUE) {
+    PyErr_Format(PyExc_ValueError,
+                 "Pointer argument cannot be accessed from Triton "
+                 "(cpu tensor?)");
+    return false;
+  }
+  fprintf(stderr, "end of extract ptr\n");
+  return true;
+}
+
+inline bool extractI8(void *ptr, PyObject *obj) {
+  *((int8_t *)ptr) = PyLong_AsLong(obj);
+  return PyErr_Occurred() == NULL;
+}
+
+inline bool extractI16(void *ptr, PyObject *obj) {
+  *((int16_t *)ptr) = PyLong_AsLong(obj);
+  return PyErr_Occurred() == NULL;
+}
+
+inline bool extractI32(void *ptr, PyObject *obj) {
+  *((int32_t *)ptr) = PyLong_AsLong(obj);
+  return PyErr_Occurred() == NULL;
+}
+
+inline bool extractI64(void *ptr, PyObject *obj) {
+  *((int64_t *)ptr) = PyLong_AsLongLong(obj);
+  return PyErr_Occurred() == NULL;
+}
+
+inline bool extractU8(void *ptr, PyObject *obj) {
+  *((uint8_t *)ptr) = PyLong_AsUnsignedLong(obj);
+  return PyErr_Occurred() == NULL;
+}
+
+inline bool extractU16(void *ptr, PyObject *obj) {
+  *((uint16_t *)ptr) = PyLong_AsUnsignedLong(obj);
+  return PyErr_Occurred() == NULL;
+}
+
+inline bool extractU32(void *ptr, PyObject *obj) {
+  *((uint32_t *)ptr) = PyLong_AsUnsignedLong(obj);
+  return PyErr_Occurred() == NULL;
+}
+
+inline bool extractU64(void *ptr, PyObject *obj) {
+  *((uint64_t *)ptr) = PyLong_AsUnsignedLongLong(obj);
+  return PyErr_Occurred() == NULL;
+}
+
+inline bool extractFP16(void *ptr, PyObject *obj) {
+  double temp_double = (double)PyFloat_AsDouble(obj);
+  uint16_t result;
+  // from https://github.com/python/pythoncapi-compat
+#if 0x030600B1 <= PY_VERSION_HEX && PY_VERSION_HEX <= 0x030B00A1 &&            \
+    !defined(PYPY_VERSION)
+  _PyFloat_Pack2(temp_double, (unsigned char *)&result, 1);
+#else
+  PyFloat_Pack2(temp_double, (char *)&result, 1);
+#endif
+  *((uint16_t *)ptr) = result;
+  return PyErr_Occurred() == NULL;
+}
+
+inline bool extractBF16(void *ptr, PyObject *obj) {
+  double temp_double = (double)PyFloat_AsDouble(obj);
+  float f32 = (float)temp_double;
+  uint32_t u32 = *(uint32_t *)&f32;
+  *((uint16_t *)ptr) = (u32 >> 16);
+  return PyErr_Occurred() == NULL;
+}
+
+inline bool extractFP32(void *ptr, PyObject *obj) {
+  double temp_double = (double)PyFloat_AsDouble(obj);
+  float f32 = (float)temp_double;
+  *((uint32_t *)ptr) = *(uint32_t *)&f32;
+  return PyErr_Occurred() == NULL;
+}
+
+inline bool extractFP64(void *ptr, PyObject *obj) {
+  double temp_double = (double)PyFloat_AsDouble(obj);
+  *((uint32_t *)ptr) = *(uint64_t *)&temp_double;
+  return PyErr_Occurred() == NULL;
+}
+
+static PyObject *launchKernel(PyObject *self, PyObject *args) {
+  // ensure cuda context is valid before calling any CUDA APIs, e.g. before
+  // getPointer calls cuPointerGetAttributes
+  ensureCudaContext();
+
+  int gridX, gridY, gridZ;
+  uint64_t _stream;
+  uint64_t _function;
+  int launch_cooperative_grid;
+  int launch_pdl;
+  PyObject *launch_enter_hook = NULL;
+  PyObject *launch_exit_hook = NULL;
+  PyObject *kernel_metadata = NULL;
+  PyObject *launch_metadata = NULL;
+  PyObject *global_scratch_obj = NULL;
+  PyObject *profile_scratch_obj = NULL;
+  PyObject *signature = NULL;
+  PyObject *kernel_args = NULL;
+
+  if (!PyArg_ParseTuple(args, "iiiKKppOOOOOOOO", &gridX, &gridY, &gridZ,
+                        &_stream, &_function, &launch_cooperative_grid,
+                        &launch_pdl, &global_scratch_obj, &profile_scratch_obj,
+                        &kernel_metadata, &launch_metadata, &launch_enter_hook,
+                        &launch_exit_hook, &signature, &kernel_args)) {
+    return NULL;
+  }
+  int num_warps, num_ctas, shared_memory;
+  if (!PyArg_ParseTuple(kernel_metadata, "iii", &num_warps, &num_ctas,
+                        &shared_memory)) {
+    PyErr_SetString(PyExc_TypeError, "kernel_metadata must be a tuple");
+    return NULL;
+  }
+
+  CUdeviceptr global_scratch = 0;
+  if (global_scratch_obj != Py_None) {
+    DevicePtrInfo global_scratch_info = getPointer(global_scratch_obj, -1);
+    if (!global_scratch_info.valid) {
+      return NULL;
+    }
+    global_scratch = global_scratch_info.dev_ptr;
+  }
+
+  CUdeviceptr profile_scratch = 0;
+  if (profile_scratch_obj != Py_None) {
+    DevicePtrInfo profile_scratch_info = getPointer(profile_scratch_obj, -1);
+    if (!profile_scratch_info.valid) {
+      return NULL;
+    }
+    profile_scratch = profile_scratch_info.dev_ptr;
+  }
+
+  // Extract args.
+  PyObject *fast_kernel_arg_types = PySequence_Fast(
+      signature, "Expected kernel_arg_types to be a sequence or iterable");
+  if (!fast_kernel_arg_types) {
+    return NULL;
+  }
+  PyObject *fast_kernel_args = PySequence_Fast(
+      kernel_args, "Expected kernel_args to be a sequence or iterable");
+  if (!fast_kernel_args) {
+    return NULL;
+  }
+  PyObject **kernel_types_data = PySequence_Fast_ITEMS(fast_kernel_arg_types);
+  PyObject **kernel_args_data = PySequence_Fast_ITEMS(fast_kernel_args);
+  Py_ssize_t num_args = PySequence_Fast_GET_SIZE(fast_kernel_arg_types);
+  fprintf(stderr, "num arg types: '%d'\n", num_args);
+  fprintf(stderr, "num args: '%d'\n",
+          PySequence_Fast_GET_SIZE(fast_kernel_args));
+  // if (num_args != PySequence_Fast_GET_SIZE(fast_kernel_args)) {
+  //   PyErr_SetString(
+  //       PyExc_TypeError,
+  //       "Expected kernel_arg_types and kernel_args to have the same size");
+  //   return NULL;
+  // }
+  void **params = (void **)alloca(num_args * sizeof(void *));
+  int params_idx = 0;
+  for (Py_ssize_t i = 0; i < num_args; ++i) {
+    PyObject *type_repr = PyObject_Repr(kernel_types_data[i]);
+    if (!type_repr) {
+      return NULL;
+    }
+    PyObject *type_str = PyUnicode_AsEncodedString(type_repr, "utf-8", "~E~");
+    if (!type_str) {
+      return NULL;
+    }
+    const char *type_bytes = PyBytes_AsString(type_str);
+    if (!type_bytes) {
+      return NULL;
+    }
+    fprintf(stderr, "arg type: '%s'\n", type_bytes);
+    // type_bytes[0] is always '
+    if (type_bytes[1] == '*') {
+      params[params_idx] = alloca(sizeof(CUdeviceptr));
+      fprintf(stderr, "is pointer\n");
+      extractPointer(params[params_idx++], kernel_args_data[i]);
+    } else if (strcmp(type_bytes, "'i8'") == 0) {
+      fprintf(stderr, "found i8\n");
+      params[params_idx] = alloca(sizeof(int8_t));
+      extractI8(params[params_idx++], kernel_args_data[i]);
+    } else if (strcmp(type_bytes, "'i16'") == 0) {
+      fprintf(stderr, "found i16\n");
+      params[params_idx] = alloca(sizeof(int16_t));
+      extractI16(params[params_idx++], kernel_args_data[i]);
+    } else if (strcmp(type_bytes, "'i32'") == 0 ||
+               strcmp(type_bytes, "'i1'") == 0) {
+      fprintf(stderr, "found i32\n");
+      params[params_idx] = alloca(sizeof(int32_t));
+      extractI32(params[params_idx++], kernel_args_data[i]);
+    } else if (strcmp(type_bytes, "'u8'") == 0) {
+      fprintf(stderr, "found u8\n");
+      params[params_idx] = alloca(sizeof(int8_t));
+      extractU8(params[params_idx++], kernel_args_data[i]);
+    } else if (strcmp(type_bytes, "'u16'") == 0) {
+      fprintf(stderr, "found u16\n");
+      params[params_idx] = alloca(sizeof(int16_t));
+      extractU16(params[params_idx++], kernel_args_data[i]);
+    } else if (strcmp(type_bytes, "'u32'") == 0 ||
+               strcmp(type_bytes, "'u1'") == 0) {
+      fprintf(stderr, "found u32\n");
+      params[params_idx] = alloca(sizeof(int32_t));
+      extractU32(params[params_idx++], kernel_args_data[i]);
+    } else if (strcmp(type_bytes, "'fp16'") == 0) {
+      fprintf(stderr, "found fp16\n");
+      params[params_idx] = alloca(sizeof(uint16_t));
+      extractFP16(params[params_idx++], kernel_args_data[i]);
+    } else if (strcmp(type_bytes, "'bf16'") == 0) {
+      fprintf(stderr, "found bf16\n");
+      params[params_idx] = alloca(sizeof(uint16_t));
+      extractBF16(params[params_idx++], kernel_args_data[i]);
+    } else if (strcmp(type_bytes, "'fp32'") == 0 ||
+               strcmp(type_bytes, "'f32'") == 0) {
+      fprintf(stderr, "found fp32\n");
+      params[params_idx] = alloca(sizeof(uint32_t));
+      extractFP32(params[params_idx++], kernel_args_data[i]);
+    } else if (strcmp(type_bytes, "'fp64'") == 0) {
+      fprintf(stderr, "found fp64\n");
+      params[params_idx] = alloca(sizeof(uint64_t));
+      extractFP64(params[params_idx++], kernel_args_data[i]);
+    } else {
+      fprintf(stderr, "ahhhhhhhhhh what is this?\n");
+    }
+  }
+
+  Py_BEGIN_ALLOW_THREADS;
+  _launch(gridX, gridY, gridZ, num_warps, num_ctas, launch_cooperative_grid,
+          launch_pdl, shared_memory, (CUstream)_stream, (CUfunction)_function,
+          global_scratch, profile_scratch, params);
+  Py_END_ALLOW_THREADS;
+  if (PyErr_Occurred()) {
+    return NULL;
+  }
+
+  Py_RETURN_NONE;
+}
+
 static PyMethodDef ModuleMethods[] = {
     {"load_binary", loadBinary, METH_VARARGS,
      "Load provided cubin into CUDA driver"},
@@ -491,6 +933,7 @@ static PyMethodDef ModuleMethods[] = {
      "particular it's an error to change this value after launching any kernel "
      "that calls printf()."},
     {"fill_tma_descriptor", fillTMADescriptor, METH_VARARGS, "doc"},
+    {"launch", launchKernel, METH_VARARGS, "doc"},
 
     {NULL, NULL, 0, NULL} // sentinel
 };

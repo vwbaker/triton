@@ -73,6 +73,7 @@ class CudaUtils(object):
         self.cuOccupancyMaxActiveClusters = mod.cuOccupancyMaxActiveClusters
         self.set_printf_fifo_size = mod.set_printf_fifo_size
         self.fill_tma_descriptor = mod.fill_tma_descriptor
+        self.launch = mod.launch
 
 
 # ------------------------
@@ -207,15 +208,23 @@ def make_launcher(constants, signature, tensordesc_meta):
         }[ty_to_cpp(ty)]
 
     expand_signature = _expand_signature(signature.values())
+    import sys
+    print(f"signature = {expand_signature}", file=sys.stderr)
     signature = {i: s for i, s in enumerate(expand_signature)}
 
     args_format = ''.join([format_of(ty) for ty in signature.values()])
     format = _BASE_ARGS_FORMAT + args_format
+    print(f"args_format = {args_format}", file=sys.stderr)
 
     flat_signature = []
     for sig in signature.values():
         _flatten_signature(sig, flat_signature)
     signature = {i: s for i, s in enumerate(flat_signature)}
+    print(f"flat_signature = {flat_signature}", file=sys.stderr)
+    print(f"enumerated signature = {signature}", file=sys.stderr)
+    # encoded_sig = {ty.encode('utf-8') for ty in flat_signature}
+    # print(f"encoded_sig = {encoded_sig}", sys.stderr)
+    return flat_signature
     args_list = ', ' + ', '.join(f"&_arg{i}" for i, ty in signature.items()) if len(signature) > 0 else ''
     # Record the end of regular arguments;
     # subsequent arguments are architecture-specific descriptors, such as tensor descriptors for CUDA.
@@ -681,17 +690,18 @@ class CudaLauncher(object):
         constants = {arg_idx(idx): value for idx, value in constants.items()}
         signature = {idx: value for idx, value in src.signature.items()}
         tensordesc_meta = getattr(metadata, "tensordesc_meta", None)
-        src = make_launcher(constants, signature, tensordesc_meta)
-        mod = compile_module_from_src(
-            src=src,
-            name="__triton_launcher",
-            library_dirs=library_dirs(),
-            include_dirs=include_dirs,
-            libraries=libraries,
-        )
+        #        mod = compile_module_from_src(
+        #            src=src,
+        #            name="__triton_launcher",
+        #            library_dirs=library_dirs(),
+        #            include_dirs=include_dirs,
+        #            libraries=libraries,
+        #        )
 
         self.num_ctas = getattr(metadata, "num_ctas", 1)
-        self.launch = wrap_handle_tensordesc(mod.launch, signature, tensordesc_meta)
+        self.launch = wrap_handle_tensordesc(triton.runtime.driver.active.utils.launch, signature, tensordesc_meta)
+        #self.launch = wrap_handle_tensordesc(mod.launch, signature, tensordesc_meta)
+        self.signature = make_launcher(constants, signature, tensordesc_meta)
         self.global_scratch_size = metadata.global_scratch_size
         self.global_scratch_align = metadata.global_scratch_align
         self.profile_scratch_size = metadata.profile_scratch_size
@@ -699,7 +709,8 @@ class CudaLauncher(object):
         self.launch_cooperative_grid = metadata.launch_cooperative_grid
         self.launch_pdl = metadata.launch_pdl
 
-    def __call__(self, gridX, gridY, gridZ, stream, function, *args):
+    def __call__(self, gridX, gridY, gridZ, stream, function, kernel_metadata, launch_metadata, launch_enter_hook,
+                 launch_exit_hook, *args):
 
         def allocate_scratch(size, align, allocator):
             if size > 0:
@@ -713,7 +724,8 @@ class CudaLauncher(object):
         profile_scratch = allocate_scratch(self.profile_scratch_size, self.profile_scratch_align,
                                            _allocation._profile_allocator)
         self.launch(gridX, gridY, gridZ, stream, function, self.launch_cooperative_grid, self.launch_pdl,
-                    global_scratch, profile_scratch, *args)
+                    global_scratch, profile_scratch, kernel_metadata, launch_metadata, launch_enter_hook,
+                    launch_exit_hook, self.signature, args)
 
 
 class CudaDriver(GPUDriver):
