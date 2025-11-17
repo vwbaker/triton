@@ -523,7 +523,6 @@ static cuLaunchKernelEx_t getLaunchKernelExHandle() {
 static void _launch(int gridX, int gridY, int gridZ, int num_warps,
                     int num_ctas, int launch_cooperative_grid, int launch_pdl,
                     int shared_memory, CUstream stream, CUfunction function,
-                    CUdeviceptr global_scratch, CUdeviceptr profile_scratch,
                     void **params) {
   if (gridX * gridY * gridZ > 0) {
     // 4 attributes that we can currently pass maximum
@@ -648,7 +647,6 @@ cleanup:
 // Extract a CUDA device pointer from a pointer-like PyObject obj, and store
 // it to the memory location pointed by ptr.
 inline bool extractPointer(void *ptr, PyObject *obj) {
-  fprintf(stderr, "start of extract ptr\n");
   CUdeviceptr *dev_ptr = ptr;
   if (obj == Py_None) {
     *dev_ptr = (CUdeviceptr)0; // valid nullptr
@@ -685,7 +683,6 @@ inline bool extractPointer(void *ptr, PyObject *obj) {
                  "(cpu tensor?)");
     return false;
   }
-  fprintf(stderr, "end of extract ptr\n");
   return true;
 }
 
@@ -796,24 +793,13 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
     PyErr_SetString(PyExc_TypeError, "kernel_metadata must be a tuple");
     return NULL;
   }
-
-  CUdeviceptr global_scratch = 0;
-  if (global_scratch_obj != Py_None) {
-    DevicePtrInfo global_scratch_info = getPointer(global_scratch_obj, -1);
-    if (!global_scratch_info.valid) {
-      return NULL;
-    }
-    global_scratch = global_scratch_info.dev_ptr;
-  }
-
-  CUdeviceptr profile_scratch = 0;
-  if (profile_scratch_obj != Py_None) {
-    DevicePtrInfo profile_scratch_info = getPointer(profile_scratch_obj, -1);
-    if (!profile_scratch_info.valid) {
-      return NULL;
-    }
-    profile_scratch = profile_scratch_info.dev_ptr;
-  }
+  // extract launch metadata
+  // if (launch_enter_hook != Py_None){
+  //   PyObject* ret = PyObject_CallOneArg(launch_enter_hook, launch_metadata);
+  //   if (!ret)
+  //     return NULL;
+  //   Py_DECREF(ret);
+  // }
 
   // Extract args.
   PyObject *fast_kernel_arg_types = PySequence_Fast(
@@ -838,7 +824,9 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   //       "Expected kernel_arg_types and kernel_args to have the same size");
   //   return NULL;
   // }
-  void **params = (void **)alloca(num_args * sizeof(void *));
+  int num_params =
+      num_args + 2; // for global_scratch & profile_scratch pointers.
+  void **params = (void **)alloca(num_params * sizeof(void *));
   int params_idx = 0;
   for (Py_ssize_t i = 0; i < num_args; ++i) {
     PyObject *type_repr = PyObject_Repr(kernel_types_data[i]);
@@ -858,7 +846,9 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
     if (type_bytes[1] == '*') {
       params[params_idx] = alloca(sizeof(CUdeviceptr));
       fprintf(stderr, "is pointer\n");
-      extractPointer(params[params_idx++], kernel_args_data[i]);
+      if (!extractPointer(params[params_idx++], kernel_args_data[i])) {
+        return NULL;
+      }
     } else if (strcmp(type_bytes, "'i8'") == 0) {
       fprintf(stderr, "found i8\n");
       params[params_idx] = alloca(sizeof(int8_t));
@@ -906,15 +896,30 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
       fprintf(stderr, "ahhhhhhhhhh what is this?\n");
     }
   }
+  params[params_idx] = alloca(sizeof(void *));
+  if (!extractPointer(params[params_idx++], global_scratch_obj)) {
+    return NULL;
+  }
+  params[params_idx] = alloca(sizeof(void *));
+  if (!extractPointer(params[params_idx++], profile_scratch_obj)) {
+    return NULL;
+  }
 
   Py_BEGIN_ALLOW_THREADS;
   _launch(gridX, gridY, gridZ, num_warps, num_ctas, launch_cooperative_grid,
           launch_pdl, shared_memory, (CUstream)_stream, (CUfunction)_function,
-          global_scratch, profile_scratch, params);
+          params);
   Py_END_ALLOW_THREADS;
   if (PyErr_Occurred()) {
     return NULL;
   }
+
+  // if(launch_exit_hook != Py_None){
+  //   PyObject* ret = PyObject_CallOneArg(launch_exit_hook, launch_metadata);
+  //   if (!ret)
+  //     return NULL;
+  //   Py_DECREF(ret);
+  // }
 
   Py_RETURN_NONE;
 }
