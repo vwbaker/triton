@@ -593,57 +593,6 @@ typedef struct _DevicePtrInfo {
   bool valid;
 } DevicePtrInfo;
 
-static PyObject *data_ptr_str = NULL;
-static PyObject *py_tensor_map_type = NULL;
-
-static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {
-  DevicePtrInfo ptr_info;
-  ptr_info.dev_ptr = 0;
-  ptr_info.valid = true;
-  if (PyLong_Check(obj)) {
-    ptr_info.dev_ptr = PyLong_AsUnsignedLongLong(obj);
-    return ptr_info;
-  }
-  if (obj == Py_None) {
-    // valid nullptr
-    return ptr_info;
-  }
-  PyObject *ret = PyObject_CallMethodNoArgs(obj, data_ptr_str);
-  if (!ret) {
-    PyErr_SetString(
-        PyExc_TypeError,
-        "Pointer argument must be either uint64 or have data_ptr method");
-    ptr_info.valid = false;
-    goto cleanup;
-  }
-  if (!PyLong_Check(ret)) {
-    PyErr_SetString(PyExc_TypeError,
-                    "data_ptr method of Pointer object must return 64-bit int");
-    ptr_info.valid = false;
-    goto cleanup;
-  }
-  ptr_info.dev_ptr = PyLong_AsUnsignedLongLong(ret);
-  if (!ptr_info.dev_ptr)
-    return ptr_info;
-  uint64_t dev_ptr;
-  int status = cuPointerGetAttribute(
-      &dev_ptr, CU_POINTER_ATTRIBUTE_DEVICE_POINTER, ptr_info.dev_ptr);
-  if (status == CUDA_ERROR_INVALID_VALUE) {
-    PyErr_Format(
-        PyExc_ValueError,
-        "Pointer argument (at %d) cannot be accessed from Triton (cpu tensor?)",
-        idx);
-    ptr_info.valid = false;
-  } else if (status != CUDA_SUCCESS) {
-    CUDA_CHECK(status); // Catch any other cuda API errors
-    ptr_info.valid = false;
-  }
-  ptr_info.dev_ptr = dev_ptr;
-cleanup:
-  Py_XDECREF(ret);
-  return ptr_info;
-}
-
 // Extract a CUDA device pointer from a pointer-like PyObject obj, and store
 // it to the memory location pointed by ptr.
 bool extractPointer(void *ptr, PyObject *obj) {
