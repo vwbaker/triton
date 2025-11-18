@@ -871,6 +871,9 @@ Extractor getExtractor(PyObject *type) {
              strcmp(type_bytes, "'i1'") == 0) {
     extractor.size = sizeof(int32_t);
     extractor.extract = extractI32;
+  } else if (strcmp(type_bytes, "'i64'") == 0) {
+    extractor.size = sizeof(int64_t);
+    extractor.extract = extractI64;
   } else if (strcmp(type_bytes, "'u8'") == 0) {
     extractor.size = sizeof(uint8_t);
     extractor.extract = extractU8;
@@ -881,6 +884,9 @@ Extractor getExtractor(PyObject *type) {
              strcmp(type_bytes, "'u1'") == 0) {
     extractor.size = sizeof(uint32_t);
     extractor.extract = extractU32;
+  } else if (strcmp(type_bytes, "'u64'") == 0) {
+    extractor.size = sizeof(uint64_t);
+    extractor.extract = extractU64;
   } else if (strcmp(type_bytes, "'fp16'") == 0) {
     extractor.size = sizeof(uint16_t);
     extractor.extract = extractFP16;
