@@ -761,6 +761,90 @@ inline bool extractFP64(void *ptr, PyObject *obj) {
   return PyErr_Occurred() == NULL;
 }
 
+bool isConstExpr(PyObject *obj) {
+  PyObject *type_repr = PyObject_Repr(obj);
+  if (!type_repr) {
+    Py_DECREF(type_repr);
+    return false;
+  }
+  PyObject *type_str = PyUnicode_AsEncodedString(type_repr, "utf-8", "~E~");
+  if (!type_str) {
+    Py_DECREF(type_repr);
+    Py_DECREF(type_str);
+    return false;
+  }
+  const char *type_bytes = PyBytes_AsString(type_str);
+  if (!type_bytes) {
+    Py_DECREF(type_repr);
+    Py_DECREF(type_str);
+    return false;
+  }
+  fprintf(stderr, "arg type: '%s'\n", type_bytes);
+  printf("arg type: '%s'\n", type_bytes);
+  bool is_constexpr = (strcmp(type_bytes, "'constexpr'") == 0);
+  Py_DECREF(type_repr);
+  Py_DECREF(type_str);
+  return is_constexpr;
+}
+
+bool flattenObjectAndDiscardConstexpr(PyObject *item, PyObject *type,
+                                      PyObject *arg_list, PyObject *type_list) {
+  if (isConstExpr(type)) {
+    return true;
+  }
+  if (PyTuple_Check(item)) {
+    // it's a tuple!
+    if (!PyTuple_Check(type)) {
+      // if item is a tuple, then type also must be!
+      printf("item is a tuple but type is not!!\n");
+      return false;
+    }
+    printf("checked that both are tuples! \n");
+    Py_ssize_t item_size = PyTuple_GET_SIZE(item);
+    Py_ssize_t type_size = PyTuple_GET_SIZE(type);
+    if (item_size != type_size) {
+      printf("item_size != type_size!!\n");
+      return false;
+    }
+    for (Py_ssize_t i = 0; i < item_size; ++i) {
+      PyObject *sub_item = PyTuple_GET_ITEM(item, i);
+      PyObject *sub_type = PyTuple_GET_ITEM(type, i);
+      if (!flattenObjectAndDiscardConstexpr(sub_item, sub_type, arg_list,
+                                            type_list)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  // not a tuple:
+  PyList_Append(arg_list, item);
+  PyList_Append(type_list, type);
+  return true;
+}
+
+bool flattenAndRemoveConstexpr(PyObject *args, PyObject *signature,
+                               PyObject *args_list, PyObject *type_list) {
+  Py_ssize_t num_args = PySequence_Fast_GET_SIZE(args);
+  Py_ssize_t num_types = PySequence_Fast_GET_SIZE(signature);
+  printf("toriiiiiiiiiiiiiiiiiiiiiiiiiii\n");
+  if (num_args != num_types) {
+    printf("uh oh num_args (%zd) != num_types (%zd)!\n", num_args, num_types);
+    return false;
+  }
+  PyObject **args_data = PySequence_Fast_ITEMS(args);
+  PyObject **types_data = PySequence_Fast_ITEMS(signature);
+  printf("got size of args_data: %d\n", num_args);
+  for (Py_ssize_t i = 0; i < num_args; ++i) {
+    printf("processing arg data for i=%zd\n", i);
+    PyObject *item = args_data[i];
+    PyObject *type = types_data[i];
+    if (!flattenObjectAndDiscardConstexpr(item, type, args_list, type_list)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 static PyObject *launchKernel(PyObject *self, PyObject *args) {
   // ensure cuda context is valid before calling any CUDA APIs, e.g. before
   // getPointer calls cuPointerGetAttributes
@@ -814,22 +898,34 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   }
   PyObject **kernel_types_data = PySequence_Fast_ITEMS(fast_kernel_arg_types);
   PyObject **kernel_args_data = PySequence_Fast_ITEMS(fast_kernel_args);
-  Py_ssize_t num_args = PySequence_Fast_GET_SIZE(fast_kernel_arg_types);
-  fprintf(stderr, "num arg types: '%d'\n", num_args);
-  fprintf(stderr, "num args: '%d'\n",
-          PySequence_Fast_GET_SIZE(fast_kernel_args));
+  // Py_ssize_t num_args = PySequence_Fast_GET_SIZE(fast_kernel_arg_types);
+  // fprintf(stderr, "num arg types: '%d'\n", num_args);
+  // fprintf(stderr, "num args: '%d'\n",
+  // PySequence_Fast_GET_SIZE(fast_kernel_args));
   // if (num_args != PySequence_Fast_GET_SIZE(fast_kernel_args)) {
   //   PyErr_SetString(
   //       PyExc_TypeError,
   //       "Expected kernel_arg_types and kernel_args to have the same size");
   //   return NULL;
   // }
+  // Flatten params.
+  PyObject *args_list = PyList_New(0);
+  PyObject *type_list = PyList_New(0);
+  if (!args_list || !type_list) {
+    goto cleanup;
+  }
+  if (!flattenAndRemoveConstexpr(fast_kernel_args, fast_kernel_arg_types,
+                                 args_list, type_list)) {
+    return NULL;
+  }
+  int num_args = PySequence_Fast_GET_SIZE(args_list);
+  printf("toriiiiiiiiiiiiiii final size: %d\n", num_args);
   int num_params =
       num_args + 2; // for global_scratch & profile_scratch pointers.
   void **params = (void **)alloca(num_params * sizeof(void *));
   int params_idx = 0;
   for (Py_ssize_t i = 0; i < num_args; ++i) {
-    PyObject *type_repr = PyObject_Repr(kernel_types_data[i]);
+    PyObject *type_repr = PyObject_Repr(PyList_GetItem(type_list, i));
     if (!type_repr) {
       Py_DECREF(type_repr);
       goto cleanup;
@@ -847,11 +943,20 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
       goto cleanup;
     }
     fprintf(stderr, "arg type: '%s'\n", type_bytes);
+    if (strcmp(type_bytes, "'constexpr'") == 0) {
+      Py_DECREF(type_repr);
+      Py_DECREF(type_str);
+      continue;
+    }
+    // if (PyTuple_Check(PyObject *p) != 0) {
+    //   // It's a tuple!
+    // }
     // type_bytes[0] is always '
+    PyObject *current_arg = PyList_GetItem(args_list, i);
     if (type_bytes[1] == '*') {
       params[params_idx] = alloca(sizeof(CUdeviceptr));
       fprintf(stderr, "is pointer\n");
-      if (!extractPointer(params[params_idx++], kernel_args_data[i])) {
+      if (!extractPointer(params[params_idx++], current_arg)) {
         Py_DECREF(type_repr);
         Py_DECREF(type_str);
         return NULL;
@@ -859,46 +964,46 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
     } else if (strcmp(type_bytes, "'i8'") == 0) {
       fprintf(stderr, "found i8\n");
       params[params_idx] = alloca(sizeof(int8_t));
-      extractI8(params[params_idx++], kernel_args_data[i]);
+      extractI8(params[params_idx++], current_arg);
     } else if (strcmp(type_bytes, "'i16'") == 0) {
       fprintf(stderr, "found i16\n");
       params[params_idx] = alloca(sizeof(int16_t));
-      extractI16(params[params_idx++], kernel_args_data[i]);
+      extractI16(params[params_idx++], current_arg);
     } else if (strcmp(type_bytes, "'i32'") == 0 ||
                strcmp(type_bytes, "'i1'") == 0) {
       fprintf(stderr, "found i32\n");
       params[params_idx] = alloca(sizeof(int32_t));
-      extractI32(params[params_idx++], kernel_args_data[i]);
+      extractI32(params[params_idx++], current_arg);
     } else if (strcmp(type_bytes, "'u8'") == 0) {
       fprintf(stderr, "found u8\n");
       params[params_idx] = alloca(sizeof(int8_t));
-      extractU8(params[params_idx++], kernel_args_data[i]);
+      extractU8(params[params_idx++], current_arg);
     } else if (strcmp(type_bytes, "'u16'") == 0) {
       fprintf(stderr, "found u16\n");
       params[params_idx] = alloca(sizeof(int16_t));
-      extractU16(params[params_idx++], kernel_args_data[i]);
+      extractU16(params[params_idx++], current_arg);
     } else if (strcmp(type_bytes, "'u32'") == 0 ||
                strcmp(type_bytes, "'u1'") == 0) {
       fprintf(stderr, "found u32\n");
       params[params_idx] = alloca(sizeof(int32_t));
-      extractU32(params[params_idx++], kernel_args_data[i]);
+      extractU32(params[params_idx++], current_arg);
     } else if (strcmp(type_bytes, "'fp16'") == 0) {
       fprintf(stderr, "found fp16\n");
       params[params_idx] = alloca(sizeof(uint16_t));
-      extractFP16(params[params_idx++], kernel_args_data[i]);
+      extractFP16(params[params_idx++], current_arg);
     } else if (strcmp(type_bytes, "'bf16'") == 0) {
       fprintf(stderr, "found bf16\n");
       params[params_idx] = alloca(sizeof(uint16_t));
-      extractBF16(params[params_idx++], kernel_args_data[i]);
+      extractBF16(params[params_idx++], current_arg);
     } else if (strcmp(type_bytes, "'fp32'") == 0 ||
                strcmp(type_bytes, "'f32'") == 0) {
       fprintf(stderr, "found fp32\n");
       params[params_idx] = alloca(sizeof(uint32_t));
-      extractFP32(params[params_idx++], kernel_args_data[i]);
+      extractFP32(params[params_idx++], current_arg);
     } else if (strcmp(type_bytes, "'fp64'") == 0) {
       fprintf(stderr, "found fp64\n");
       params[params_idx] = alloca(sizeof(uint64_t));
-      extractFP64(params[params_idx++], kernel_args_data[i]);
+      extractFP64(params[params_idx++], current_arg);
     } else {
       fprintf(stderr, "ahhhhhhhhhh what is this?\n");
     }
@@ -933,6 +1038,8 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
 cleanup:
   Py_DECREF(fast_kernel_arg_types);
   Py_DECREF(fast_kernel_args);
+  Py_DECREF(args_list);
+  Py_DECREF(type_list);
   Py_RETURN_NONE;
 }
 

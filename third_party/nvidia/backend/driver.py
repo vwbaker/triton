@@ -210,6 +210,7 @@ def make_launcher(constants, signature, tensordesc_meta):
     expand_signature = _expand_signature(signature.values())
     import sys
     print(f"signature = {expand_signature}", file=sys.stderr)
+    return expand_signature
     signature = {i: s for i, s in enumerate(expand_signature)}
 
     args_format = ''.join([format_of(ty) for ty in signature.values()])
@@ -224,7 +225,6 @@ def make_launcher(constants, signature, tensordesc_meta):
     print(f"enumerated signature = {signature}", file=sys.stderr)
     # encoded_sig = {ty.encode('utf-8') for ty in flat_signature}
     # print(f"encoded_sig = {encoded_sig}", sys.stderr)
-    return flat_signature
     args_list = ', ' + ', '.join(f"&_arg{i}" for i, ty in signature.items()) if len(signature) > 0 else ''
     # Record the end of regular arguments;
     # subsequent arguments are architecture-specific descriptors, such as tensor descriptors for CUDA.
@@ -723,6 +723,20 @@ class CudaLauncher(object):
         global_scratch = allocate_scratch(self.global_scratch_size, self.global_scratch_align, _allocation._allocator)
         profile_scratch = allocate_scratch(self.profile_scratch_size, self.profile_scratch_align,
                                            _allocation._profile_allocator)
+
+        def _flatten_args(args, output):
+            for a in args:
+                if isinstance(a, tuple):
+                    _flatten_args(a, output)
+                else:
+                    output.append(a)
+
+        flat_args = []
+        _flatten_args(args, flat_args)
+        print(f"flattened args = {flat_args}")
+        print(f"original args = {args}")
+        print(f"self.signature={self.signature}")
+
         self.launch(gridX, gridY, gridZ, stream, function, self.launch_cooperative_grid, self.launch_pdl,
                     global_scratch, profile_scratch, kernel_metadata, launch_metadata, launch_enter_hook,
                     launch_exit_hook, self.signature, args)
