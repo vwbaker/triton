@@ -734,57 +734,6 @@ bool isConstExpr(PyObject *obj) {
   return is_constexpr;
 }
 
-bool flattenObjectAndDiscardConstexpr(PyObject *item, PyObject *type,
-                                      PyObject *arg_list, PyObject *type_list) {
-  if (isConstExpr(type)) {
-    return true;
-  }
-  if (PyTuple_Check(item)) {
-    // it's a tuple!
-    if (!PyTuple_Check(type)) {
-      // if item is a tuple, then type also must be!
-      return false;
-    }
-    Py_ssize_t item_size = PyTuple_GET_SIZE(item);
-    Py_ssize_t type_size = PyTuple_GET_SIZE(type);
-    if (item_size != type_size) {
-      return false;
-    }
-    for (Py_ssize_t i = 0; i < item_size; ++i) {
-      PyObject *sub_item = PyTuple_GET_ITEM(item, i);
-      PyObject *sub_type = PyTuple_GET_ITEM(type, i);
-      if (!flattenObjectAndDiscardConstexpr(sub_item, sub_type, arg_list,
-                                            type_list)) {
-        return false;
-      }
-    }
-    return true;
-  }
-  // not a tuple:
-  PyList_Append(arg_list, item);
-  PyList_Append(type_list, type);
-  return true;
-}
-
-bool flattenAndRemoveConstexpr(PyObject *args, PyObject *signature,
-                               PyObject *args_list, PyObject *type_list) {
-  Py_ssize_t num_args = PySequence_Fast_GET_SIZE(args);
-  Py_ssize_t num_types = PySequence_Fast_GET_SIZE(signature);
-  if (num_args != num_types) {
-    return false;
-  }
-  PyObject **args_data = PySequence_Fast_ITEMS(args);
-  PyObject **types_data = PySequence_Fast_ITEMS(signature);
-  for (Py_ssize_t i = 0; i < num_args; ++i) {
-    PyObject *item = args_data[i];
-    PyObject *type = types_data[i];
-    if (!flattenObjectAndDiscardConstexpr(item, type, args_list, type_list)) {
-      return false;
-    }
-  }
-  return true;
-}
-
 typedef bool (*ExtractorFunc)(void *ptr, PyObject *obj);
 
 typedef struct {
@@ -911,16 +860,6 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
     return NULL;
   }
 
-  // PyObject *args_list = PyList_New(0);
-  // PyObject *type_list = PyList_New(0);
-  // if (!args_list || !type_list) {
-  //   goto cleanup;
-  // }
-  // if (!flattenAndRemoveConstexpr(fast_kernel_args, fast_kernel_arg_types,
-  //                                args_list, type_list)) {
-  //   goto cleanup;
-  //   return NULL;
-  // }
   Py_ssize_t num_args = PySequence_Fast_GET_SIZE(fast_kernel_args);
   Py_ssize_t num_types = PySequence_Fast_GET_SIZE(fast_kernel_arg_types);
   if (num_args != num_types) {
@@ -975,8 +914,6 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
 cleanup:
   Py_DECREF(fast_kernel_arg_types);
   Py_DECREF(fast_kernel_args);
-  // Py_DECREF(args_list);
-  // Py_DECREF(type_list);
   return NULL;
 }
 
