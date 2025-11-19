@@ -911,17 +911,24 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
     return NULL;
   }
 
-  PyObject *args_list = PyList_New(0);
-  PyObject *type_list = PyList_New(0);
-  if (!args_list || !type_list) {
-    goto cleanup;
-  }
-  if (!flattenAndRemoveConstexpr(fast_kernel_args, fast_kernel_arg_types,
-                                 args_list, type_list)) {
+  // PyObject *args_list = PyList_New(0);
+  // PyObject *type_list = PyList_New(0);
+  // if (!args_list || !type_list) {
+  //   goto cleanup;
+  // }
+  // if (!flattenAndRemoveConstexpr(fast_kernel_args, fast_kernel_arg_types,
+  //                                args_list, type_list)) {
+  //   goto cleanup;
+  //   return NULL;
+  // }
+  Py_ssize_t num_args = PySequence_Fast_GET_SIZE(fast_kernel_args);
+  Py_ssize_t num_types = PySequence_Fast_GET_SIZE(fast_kernel_arg_types);
+  if (num_args != num_types) {
     goto cleanup;
     return NULL;
   }
-  int num_args = PySequence_Fast_GET_SIZE(args_list);
+  PyObject **args_data = PySequence_Fast_ITEMS(fast_kernel_args);
+  PyObject **types_data = PySequence_Fast_ITEMS(fast_kernel_arg_types);
   // Number of parameters passed to kernel. + 2 for global & profile scratch.
   int num_params = num_args + 2;
   void **params = (void **)alloca(num_params * sizeof(void *));
@@ -932,8 +939,8 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
     // Get extractor that will send back a struct with
     // * size
     // * function to call.
-    Extractor extractor = getExtractor(PyList_GetItem(type_list, i));
-    PyObject *current_arg = PyList_GetItem(args_list, i);
+    Extractor extractor = getExtractor(types_data[i]);
+    PyObject *current_arg = args_data[i];
     params[params_idx] = alloca(extractor.size);
     if (!extractor.extract(params[params_idx++], current_arg)) {
       goto cleanup;
@@ -963,13 +970,14 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
       goto cleanup;
     Py_DECREF(ret);
   }
+  Py_RETURN_NONE;
 
 cleanup:
   Py_DECREF(fast_kernel_arg_types);
   Py_DECREF(fast_kernel_args);
-  Py_DECREF(args_list);
-  Py_DECREF(type_list);
-  Py_RETURN_NONE;
+  // Py_DECREF(args_list);
+  // Py_DECREF(type_list);
+  return NULL;
 }
 
 static PyMethodDef ModuleMethods[] = {

@@ -4,6 +4,7 @@ import subprocess
 import triton
 import re
 from pathlib import Path
+from typing import Any
 from triton import knobs
 from triton.runtime.build import compile_module_from_src
 from triton.runtime import _allocation
@@ -125,6 +126,20 @@ _BASE_ARGS_FORMAT = "iiiKKppOOOOOO"
 _BASE_ARGS_FORMAT_LEN = len(_BASE_ARGS_FORMAT)
 
 
+class KernelArg:
+    signature: Any
+    is_constant: bool
+    is_tuple: bool
+
+    def __init__(self, signature: Any, is_constant: bool = False, is_tuple: bool = False):
+        self.signature = signature
+        self.is_constant = is_constant
+        self.is_tuple = is_tuple
+
+    def __str__(self):
+        return f"KernelArg(signature={self.signature}, is_constant={self.is_constant}, is_tuple={self.is_tuple})"
+
+
 def make_launcher(constants, signature, tensordesc_meta):
 
     def _expand_signature(signature):
@@ -208,7 +223,28 @@ def make_launcher(constants, signature, tensordesc_meta):
         }[ty_to_cpp(ty)]
 
     expand_signature = _expand_signature(signature.values())
-    return expand_signature
+
+    def annotate_signature(signature):
+        annotated_signature = []
+        for s in signature:
+            if s == "constexpr":
+                annotated_signature.append(KernelArg(s, True, False))
+            elif isinstance(s, tuple):
+                annotated_signature.append((KernelArg(annotate_signature(s), False, True)))
+            else:
+                annotated_signature.append(KernelArg((s)))
+        return annotated_signature
+
+    flat_signature = []
+    for sig in expand_signature:
+        _flatten_signature(sig, flat_signature)
+    final_signature = [x for x in flat_signature if x != "constexpr"]
+
+    # print()
+    # print(f"expand_signature={expand_signature}")
+    # print(f"annotated_signature={annotate_signature(expand_signature)}")
+
+    return (final_signature, annotate_signature(expand_signature))
     signature = {i: s for i, s in enumerate(expand_signature)}
 
     args_format = ''.join([format_of(ty) for ty in signature.values()])
@@ -695,7 +731,7 @@ class CudaLauncher(object):
         self.num_ctas = getattr(metadata, "num_ctas", 1)
         self.launch = wrap_handle_tensordesc(triton.runtime.driver.active.utils.launch, signature, tensordesc_meta)
         #self.launch = wrap_handle_tensordesc(mod.launch, signature, tensordesc_meta)
-        self.signature = make_launcher(constants, signature, tensordesc_meta)
+        self.signature, self.arg_annotations = make_launcher(constants, signature, tensordesc_meta)
         self.global_scratch_size = metadata.global_scratch_size
         self.global_scratch_align = metadata.global_scratch_align
         self.profile_scratch_size = metadata.profile_scratch_size
@@ -717,10 +753,24 @@ class CudaLauncher(object):
         global_scratch = allocate_scratch(self.global_scratch_size, self.global_scratch_align, _allocation._allocator)
         profile_scratch = allocate_scratch(self.profile_scratch_size, self.profile_scratch_align,
                                            _allocation._profile_allocator)
+        final_args = []
+        final_signature = []
+
+        def extract_args(annotated_signature, args, final_arg_list):
+            for sig, arg in zip(annotated_signature, args):
+                # print(f"sig={sig}, arg={arg}")
+                if (sig.is_tuple):  # tuple
+                    #flatten
+                    extract_args(sig.signature, arg, final_arg_list)
+                elif (not sig.is_constant):
+                    final_arg_list.append(arg)
+                    final_signature.append(sig.signature)
+
+        extract_args(self.arg_annotations, args, final_args)
 
         self.launch(gridX, gridY, gridZ, stream, function, self.launch_cooperative_grid, self.launch_pdl,
                     global_scratch, profile_scratch, kernel_metadata, launch_metadata, launch_enter_hook,
-                    launch_exit_hook, self.signature, args)
+                    launch_exit_hook, self.signature, final_args)
 
 
 class CudaDriver(GPUDriver):
