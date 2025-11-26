@@ -809,7 +809,7 @@ cleanup:
 
 static PyObject *launchKernel(PyObject *self, PyObject *args) {
   // ensure cuda context is valid before calling any CUDA APIs, e.g. before
-  // getPointer calls cuPointerGetAttributes
+  // calls to cuPointerGetAttributes
   ensureCudaContext();
 
   // Parse the arguments.
@@ -864,7 +864,6 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   Py_ssize_t num_types = PySequence_Fast_GET_SIZE(fast_kernel_arg_types);
   if (num_args != num_types) {
     goto cleanup;
-    return NULL;
   }
   PyObject **args_data = PySequence_Fast_ITEMS(fast_kernel_args);
   PyObject **types_data = PySequence_Fast_ITEMS(fast_kernel_arg_types);
