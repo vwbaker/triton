@@ -140,7 +140,7 @@ class KernelArg:
         return f"KernelArg(signature={self.signature}, is_constant={self.is_constant}, is_tuple={self.is_tuple})"
 
 
-def make_launcher(signature, tensordesc_meta):
+def make_signature(signature, tensordesc_meta):
 
     def _expand_signature(signature):
         output = []
@@ -189,8 +189,8 @@ def make_launcher(signature, tensordesc_meta):
         else:
             output.append(sig)
 
-    expand_signature = _expand_signature(signature.values())
-
+    # This creates a signature with an efficient method to flatten & remove
+    # constexpr from the args list before passing it to the launcher.
     def annotate_signature(signature):
         annotated_signature = []
         for s in signature:
@@ -202,12 +202,14 @@ def make_launcher(signature, tensordesc_meta):
                 annotated_signature.append(KernelArg((s)))
         return annotated_signature
 
+    expanded_signature = _expand_signature(signature.values())
+    arg_annotations = annotate_signature(expanded_signature)
     flat_signature = []
-    for sig in expand_signature:
+    for sig in expanded_signature:
         _flatten_signature(sig, flat_signature)
-    final_signature = [x for x in flat_signature if x != "constexpr"]
+    kernel_signature = [x for x in flat_signature if x != "constexpr"]
 
-    return final_signature, annotate_signature(expand_signature)
+    return kernel_signature, arg_annotations
 
 
 # The TMA dtype enum values are slightly different on host vs device...
@@ -294,7 +296,7 @@ class CudaLauncher(object):
 
         self.num_ctas = getattr(metadata, "num_ctas", 1)
         self.launch = wrap_handle_tensordesc(triton.runtime.driver.active.utils.launch, signature, tensordesc_meta)
-        self.signature, self.arg_annotations = make_launcher(signature, tensordesc_meta)
+        self.kernel_signature, self.arg_annotations = make_signature(signature, tensordesc_meta)
         self.global_scratch_size = metadata.global_scratch_size
         self.global_scratch_align = metadata.global_scratch_align
         self.profile_scratch_size = metadata.profile_scratch_size
@@ -317,19 +319,20 @@ class CudaLauncher(object):
         profile_scratch = allocate_scratch(self.profile_scratch_size, self.profile_scratch_align,
                                            _allocation._profile_allocator)
 
-        def extract_args(annotated_signature, args, final_arg_list):
-            for sig, arg in zip(annotated_signature, args):
+        def extract_args(annotated_signature, args):
+            count = len(annotated_signature)
+            for i in range(count):
+                sig = annotated_signature[i]
                 if (sig.is_tuple):
-                    extract_args(sig.signature, arg, final_arg_list)
+                    yield from extract_args(sig.signature, args[i])
                 elif (not sig.is_constant):
-                    final_arg_list.append(arg)
+                    yield args[i]
 
-        final_args = []
-        extract_args(self.arg_annotations, args, final_args)
+        final_args = list(extract_args(self.arg_annotations, args))
 
         self.launch(gridX, gridY, gridZ, stream, function, self.launch_cooperative_grid, self.launch_pdl,
                     global_scratch, profile_scratch, kernel_metadata, launch_metadata, launch_enter_hook,
-                    launch_exit_hook, self.signature, final_args)
+                    launch_exit_hook, self.kernel_signature, final_args)
 
 
 class CudaDriver(GPUDriver):
