@@ -593,6 +593,8 @@ typedef struct _DevicePtrInfo {
   bool valid;
 } DevicePtrInfo;
 
+static PyObject *data_ptr_str = NULL;
+
 // Extract a CUDA device pointer from a pointer-like PyObject obj, and store
 // it to the memory location pointed by ptr.
 bool extractPointer(void *ptr, PyObject *obj) {
@@ -605,19 +607,11 @@ bool extractPointer(void *ptr, PyObject *obj) {
     *dev_ptr = PyLong_AsUnsignedLongLong(obj);
     return true;
   }
-  PyObject *data_ptr = PyObject_GetAttrString(obj, "data_ptr");
-  if (!data_ptr) {
-    PyErr_Format(PyExc_TypeError,
-                 "Pointer argument must be either uint64 or have data_ptr "
-                 "method, but got %R",
-                 obj);
-    return false;
-  }
-  PyObject *empty_tuple = PyTuple_New(0);
-  PyObject *ret = PyObject_Call(data_ptr, empty_tuple, NULL);
+  PyObject *ret = PyObject_CallMethodNoArgs(obj, data_ptr_str);
   if (!PyLong_Check(ret)) {
-    PyErr_SetString(PyExc_TypeError,
-                    "data_ptr method of Pointer object must return 64-bit int");
+    PyErr_SetString(
+        PyExc_TypeError,
+        "Pointer argument must be either uint64 or have data_ptr method");
     return false;
   }
   *dev_ptr = PyLong_AsUnsignedLongLong(ret);
@@ -947,6 +941,10 @@ PyMODINIT_FUNC PyInit_cuda_utils(void) {
 
   PyObject *m = PyModule_Create(&ModuleDef);
   if (m == NULL) {
+    return NULL;
+  }
+  data_ptr_str = PyUnicode_InternFromString("data_ptr");
+  if (data_ptr_str == NULL) {
     return NULL;
   }
 
