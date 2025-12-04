@@ -806,25 +806,20 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   uint64_t _function;
   int launch_cooperative_grid;
   int launch_pdl;
+  int num_warps, num_ctas, shared_memory;
+  PyObject *launch_metadata = NULL;
   PyObject *launch_enter_hook = NULL;
   PyObject *launch_exit_hook = NULL;
-  PyObject *kernel_metadata = NULL;
-  PyObject *launch_metadata = NULL;
   PyObject *global_scratch_obj = NULL;
   PyObject *profile_scratch_obj = NULL;
   PyObject *signature = NULL;
   PyObject *kernel_args = NULL;
-  if (!PyArg_ParseTuple(args, "iiiKKppOOOOOOOO", &gridX, &gridY, &gridZ,
+  if (!PyArg_ParseTuple(args, "iiiKKpp(iii)OOOOOOO", &gridX, &gridY, &gridZ,
                         &_stream, &_function, &launch_cooperative_grid,
-                        &launch_pdl, &global_scratch_obj, &profile_scratch_obj,
-                        &kernel_metadata, &launch_metadata, &launch_enter_hook,
-                        &launch_exit_hook, &signature, &kernel_args)) {
-    return NULL;
-  }
-  int num_warps, num_ctas, shared_memory;
-  if (!PyArg_ParseTuple(kernel_metadata, "iii", &num_warps, &num_ctas,
-                        &shared_memory)) {
-    PyErr_SetString(PyExc_TypeError, "kernel_metadata must be a tuple");
+                        &launch_pdl, &num_warps, &num_ctas, &shared_memory,
+                        &launch_metadata, &launch_enter_hook, &launch_exit_hook,
+                        &global_scratch_obj, &profile_scratch_obj, &signature,
+                        &kernel_args)) {
     return NULL;
   }
 
