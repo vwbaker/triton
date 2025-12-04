@@ -700,7 +700,7 @@ bool extractFP32(void *ptr, PyObject *obj) {
 
 bool extractFP64(void *ptr, PyObject *obj) {
   double temp_double = (double)PyFloat_AsDouble(obj);
-  *((uint32_t *)ptr) = *(uint64_t *)&temp_double;
+  *((uint64_t *)ptr) = *(uint64_t *)&temp_double;
   return PyErr_Occurred() == NULL;
 }
 
