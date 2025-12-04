@@ -845,6 +845,7 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   PyObject *fast_kernel_args = PySequence_Fast(
       kernel_args, "Expected kernel_args to be a sequence or iterable");
   if (!fast_kernel_args) {
+    Py_DECREF(fast_kernel_arg_types);
     return NULL;
   }
 
@@ -899,6 +900,8 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
       goto cleanup;
     Py_DECREF(ret);
   }
+  Py_DECREF(fast_kernel_arg_types);
+  Py_DECREF(fast_kernel_args);
   Py_RETURN_NONE;
 
 cleanup:
