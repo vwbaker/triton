@@ -720,9 +720,12 @@ bool extractTmaDesc(void *ptr, PyObject *obj) {
 
 typedef bool (*ExtractorFunc)(void *ptr, PyObject *obj);
 
+#define MAX_NAMES_PER_EXTRACTOR 2
+
 typedef struct {
   ExtractorFunc extract;
   size_t size;
+  const char *name[MAX_NAMES_PER_EXTRACTOR];
 } Extractor;
 
 typedef enum {
@@ -751,42 +754,69 @@ typedef enum {
 } ExtractorTypeIndex;
 
 Extractor extraction_map[EXTRACTOR_TYPE_COUNT] = {
-    [EXTRACTOR_UNKOWN_INDEX] = (Extractor){.extract = NULL, .size = 0},
-    [EXTRACTOR_POINTER_INDEX] =
-        (Extractor){.extract = extractPointer, .size = sizeof(CUdeviceptr)},
-    [EXTRACTOR_INT8_INDEX] =
-        (Extractor){.extract = extractI8, .size = sizeof(int8_t)},
-    [EXTRACTOR_INT16_INDEX] =
-        (Extractor){.extract = extractI16, .size = sizeof(int16_t)},
-    [EXTRACTOR_INT32_INDEX] =
-        (Extractor){.extract = extractI32, .size = sizeof(int32_t)},
-    [EXTRACTOR_INT64_INDEX] =
-        (Extractor){.extract = extractI64, .size = sizeof(int64_t)},
-    [EXTRACTOR_UINT8_INDEX] =
-        (Extractor){.extract = extractU8, .size = sizeof(uint8_t)},
-    [EXTRACTOR_UINT16_INDEX] =
-        (Extractor){.extract = extractU16, .size = sizeof(uint16_t)},
-    [EXTRACTOR_UINT32_INDEX] =
-        (Extractor){.extract = extractU32, .size = sizeof(uint32_t)},
-    [EXTRACTOR_UINT64_INDEX] =
-        (Extractor){.extract = extractU64, .size = sizeof(uint64_t)},
-    [EXTRACTOR_FP16_INDEX] =
-        (Extractor){.extract = extractFP16, .size = sizeof(uint16_t)},
-    [EXTRACTOR_BF16_INDEX] =
-        (Extractor){.extract = extractBF16, .size = sizeof(uint16_t)},
-    [EXTRACTOR_FP32_INDEX] =
-        (Extractor){.extract = extractFP32, .size = sizeof(uint32_t)},
-    [EXTRACTOR_FP64_INDEX] =
-        (Extractor){.extract = extractFP64, .size = sizeof(uint64_t)},
-    [EXTRACTOR_NVTMADESC_INDEX] =
-        (Extractor){.extract = extractTmaDesc, .size = sizeof(CUtensorMap)},
+    [EXTRACTOR_UNKOWN_INDEX] =
+        (Extractor){.extract = NULL, .size = 0, .name = NULL},
+    [EXTRACTOR_POINTER_INDEX] = (Extractor){.extract = extractPointer,
+                                            .size = sizeof(CUdeviceptr),
+                                            .name = NULL},
+    [EXTRACTOR_INT8_INDEX] = (Extractor){.extract = extractI8,
+                                         .size = sizeof(int8_t),
+                                         .name = {"'i8'"}},
+    [EXTRACTOR_INT16_INDEX] = (Extractor){.extract = extractI16,
+                                          .size = sizeof(int16_t),
+                                          .name = {"'i16'"}},
+    [EXTRACTOR_INT32_INDEX] = (Extractor){.extract = extractI32,
+                                          .size = sizeof(int32_t),
+                                          .name = {"'i1'", "'i32'"}},
+    [EXTRACTOR_INT64_INDEX] = (Extractor){.extract = extractI64,
+                                          .size = sizeof(int64_t),
+                                          .name = {"'i64'"}},
+    [EXTRACTOR_UINT8_INDEX] = (Extractor){.extract = extractU8,
+                                          .size = sizeof(uint8_t),
+                                          .name = {"'u8'"}},
+    [EXTRACTOR_UINT16_INDEX] = (Extractor){.extract = extractU16,
+                                           .size = sizeof(uint16_t),
+                                           .name = {"'u16'"}},
+    [EXTRACTOR_UINT32_INDEX] = (Extractor){.extract = extractU32,
+                                           .size = sizeof(uint32_t),
+                                           .name = {"'u1'", "'u32'"}},
+    [EXTRACTOR_UINT64_INDEX] = (Extractor){.extract = extractU64,
+                                           .size = sizeof(uint64_t),
+                                           .name = {"'u64'"}},
+    [EXTRACTOR_FP16_INDEX] = (Extractor){.extract = extractFP16,
+                                         .size = sizeof(uint16_t),
+                                         .name = {"'fp16'"}},
+    [EXTRACTOR_BF16_INDEX] = (Extractor){.extract = extractBF16,
+                                         .size = sizeof(uint16_t),
+                                         .name = {"'bf16'"}},
+    [EXTRACTOR_FP32_INDEX] = (Extractor){.extract = extractFP32,
+                                         .size = sizeof(uint32_t),
+                                         .name = {"'fp32'", "'f32'"}},
+    [EXTRACTOR_FP64_INDEX] = (Extractor){.extract = extractFP64,
+                                         .size = sizeof(uint64_t),
+                                         .name = {"'fp64'"}},
+    [EXTRACTOR_NVTMADESC_INDEX] = (Extractor){.extract = extractTmaDesc,
+                                              .size = sizeof(CUtensorMap),
+                                              .name = {"'nvTmaDesc'"}},
 };
 
-Extractor getExtractor(ExtractorTypeIndex index) {
-  if (index > EXTRACTOR_TYPE_COUNT) {
+Extractor getExtractor(PyObject *obj) {
+  uint8_t index = PyLong_AsLong(obj);
+  if (index >= EXTRACTOR_TYPE_COUNT) {
     return extraction_map[EXTRACTOR_UNKOWN_INDEX];
   }
   return extraction_map[index];
+}
+
+bool isMatch(const char *type_bytes, ExtractorTypeIndex idx) {
+  Extractor extractor = extraction_map[idx];
+  for (int j = 0; j < MAX_NAMES_PER_EXTRACTOR; j++) {
+    if (extractor.name[j] != NULL &&
+        strcmp(type_bytes, extractor.name[j]) == 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 ExtractorTypeIndex getExtractorIndex(PyObject *type) {
@@ -804,48 +834,75 @@ ExtractorTypeIndex getExtractorIndex(PyObject *type) {
   if (!type_bytes) {
     goto cleanup;
   }
+  if (strlen(type_bytes) < 2) {
+    PyErr_Format(PyExc_RuntimeError, "Unexpected data type: %R", type_repr);
+    goto cleanup;
+  }
 
   // Examples: '*fp32', 'fp32', 'i8', etc.
   if (type_bytes[1] == '*') {
     index = EXTRACTOR_POINTER_INDEX;
-  } else if (strcmp(type_bytes, "'i8'") == 0) {
-    index = EXTRACTOR_INT8_INDEX;
-  } else if (strcmp(type_bytes, "'i16'") == 0) {
-    index = EXTRACTOR_INT16_INDEX;
-  } else if (strcmp(type_bytes, "'i32'") == 0 ||
-             strcmp(type_bytes, "'i1'") == 0) {
-    index = EXTRACTOR_INT32_INDEX;
-  } else if (strcmp(type_bytes, "'i64'") == 0) {
-    index = EXTRACTOR_INT64_INDEX;
-  } else if (strcmp(type_bytes, "'u8'") == 0) {
-    index = EXTRACTOR_UINT8_INDEX;
-  } else if (strcmp(type_bytes, "'u16'") == 0) {
-    index = EXTRACTOR_UINT16_INDEX;
-  } else if (strcmp(type_bytes, "'u32'") == 0 ||
-             strcmp(type_bytes, "'u1'") == 0) {
-    index = EXTRACTOR_UINT32_INDEX;
-  } else if (strcmp(type_bytes, "'u64'") == 0) {
-    index = EXTRACTOR_UINT64_INDEX;
-  } else if (strcmp(type_bytes, "'fp16'") == 0) {
-    index = EXTRACTOR_FP16_INDEX;
-  } else if (strcmp(type_bytes, "'bf16'") == 0) {
-    index = EXTRACTOR_BF16_INDEX;
-  } else if (strcmp(type_bytes, "'fp32'") == 0 ||
-             strcmp(type_bytes, "'f32'") == 0) {
-    index = EXTRACTOR_FP32_INDEX;
-  } else if (strcmp(type_bytes, "'fp64'") == 0) {
-    index = EXTRACTOR_FP64_INDEX;
-  } else if (strcmp(type_bytes, "'nvTmaDesc'") == 0) {
-    index = EXTRACTOR_NVTMADESC_INDEX;
-  } else {
-    PyErr_Format(PyExc_RuntimeError, "Unknown data type: %R", type_repr);
     goto cleanup;
   }
+  for (ExtractorTypeIndex i = EXTRACTOR_INT8_INDEX; i < EXTRACTOR_TYPE_COUNT;
+       i++) {
+    if (isMatch(type_bytes, i)) {
+      index = i;
+      goto cleanup;
+    }
+  }
+
+  PyErr_Format(PyExc_RuntimeError, "Unknown data type: %R", type_repr);
+  goto cleanup;
 
 cleanup:
   Py_DECREF(type_repr);
   Py_DECREF(type_str);
   return index;
+}
+
+static PyObject *buildSignatureMetadata(PyObject *self, PyObject *args) {
+  PyObject *signature = NULL;
+  if (!PyArg_ParseTuple(args, "O", &signature)) {
+    return NULL;
+  }
+  PyObject *fast_signature = PySequence_Fast(
+      signature, "Expected kernel_arg_types to be a sequence or iterable");
+  if (!fast_signature) {
+    return NULL;
+  }
+  Py_ssize_t signature_size = PySequence_Fast_GET_SIZE(fast_signature);
+  PyObject **signature_items = PySequence_Fast_ITEMS(fast_signature);
+
+  PyObject *signature_list = PyList_New(0);
+  if (signature_list == NULL) {
+    Py_DECREF(fast_signature);
+    return NULL;
+  }
+  for (Py_ssize_t i = 0; i < signature_size; ++i) {
+    ExtractorTypeIndex extractor_idx = getExtractorIndex(signature_items[i]);
+    if (extractor_idx == EXTRACTOR_UNKOWN_INDEX) {
+      goto cleanup;
+    }
+    PyObject *py_index = PyLong_FromLong(extractor_idx);
+    if (py_index == NULL) {
+      goto cleanup;
+    }
+    if (PyList_Append(signature_list, py_index) < 0) {
+      Py_DECREF(py_index);
+      goto cleanup;
+    }
+    Py_DECREF(py_index);
+  }
+
+  PyObject *ret_bytes = PyBytes_FromObject(signature_list);
+  Py_DECREF(signature_list);
+  return ret_bytes;
+
+cleanup:
+  Py_XDECREF(fast_signature);
+  Py_XDECREF(signature_list);
+  return NULL;
 }
 
 static PyObject *launchKernel(PyObject *self, PyObject *args) {
@@ -918,8 +975,7 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
     // Get extractor that will send back a struct with
     // * size
     // * function to call.
-    ExtractorTypeIndex extractor_idx = getExtractorIndex(types_data[i]);
-    Extractor extractor = getExtractor(extractor_idx);
+    Extractor extractor = getExtractor(types_data[i]);
     if (extractor.extract == NULL) {
       goto cleanup;
     }
@@ -978,7 +1034,11 @@ static PyMethodDef ModuleMethods[] = {
      "particular it's an error to change this value after launching any kernel "
      "that calls printf()."},
     {"fill_tma_descriptor", fillTMADescriptor, METH_VARARGS, "doc"},
-    {"launch", launchKernel, METH_VARARGS, "doc"},
+    {"build_signature_metadata", buildSignatureMetadata, METH_VARARGS,
+     "Calling it with a signature list (ex: ['*fp32', 'u8', 'nvTmaDesc']), "
+     "will return metadata to be passed into 'launchKernel' for quicker "
+     "argument parsing."},
+    {"launch", launchKernel, METH_VARARGS, "launches cuda kernel"},
 
     {NULL, NULL, 0, NULL} // sentinel
 };

@@ -76,6 +76,7 @@ class CudaUtils(object):
         self.set_printf_fifo_size = mod.set_printf_fifo_size
         self.fill_tma_descriptor = mod.fill_tma_descriptor
         self.launch = mod.launch
+        self.build_signature_metadata = mod.build_signature_metadata
 
 
 # ------------------------
@@ -182,7 +183,7 @@ def make_kernel_signature(signature, tensordesc_meta):
         _flatten_signature(sig, flat_signature)
     kernel_signature = [x for x in flat_signature if x != "constexpr"]
 
-    return kernel_signature
+    return triton.runtime.driver.active.utils.build_signature_metadata(kernel_signature)
 
 
 @dataclass(frozen=True)
