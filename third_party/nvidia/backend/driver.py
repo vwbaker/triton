@@ -3,6 +3,7 @@ import os
 import subprocess
 import triton
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from triton import knobs
@@ -126,18 +127,13 @@ _BASE_ARGS_FORMAT = "iiiKKppOOOOOO"
 _BASE_ARGS_FORMAT_LEN = len(_BASE_ARGS_FORMAT)
 
 
+@dataclass(frozen=True)
 class KernelArg:
     signature: Any
-    is_constant: bool
-    is_tuple: bool
-
-    def __init__(self, signature: Any, is_constant: bool = False, is_tuple: bool = False):
-        self.signature = signature
-        self.is_constant = is_constant
-        self.is_tuple = is_tuple
-
-    def __str__(self):
-        return f"KernelArg(signature={self.signature}, is_constant={self.is_constant}, is_tuple={self.is_tuple})"
+    is_constant: bool = False
+    is_tuple: bool = False
+    is_tma: bool = False
+    tensordesc_idx: int | None = None
 
 
 def make_signature(signature, tensordesc_meta):
@@ -193,17 +189,21 @@ def make_signature(signature, tensordesc_meta):
     # constexpr from the args list before passing it to the launcher.
     def annotate_signature(signature):
         annotated_signature = []
-        for s in signature:
-            if s == "constexpr":
-                annotated_signature.append(KernelArg(s, True, False))
-            elif isinstance(s, tuple):
-                annotated_signature.append((KernelArg(annotate_signature(s), False, True)))
+        tensordesc_idx = 0
+        for sig in signature:
+            if sig == "constexpr":
+                annotated_signature.append(KernelArg(sig, is_constant=True))
+            elif isinstance(sig, tuple):
+                annotated_signature.append((KernelArg(annotate_signature(sig), is_tuple=True)))
+            elif isinstance(sig, str) and sig.startswith("tensordesc"):
+                annotated_signature.append(KernelArg(sig, is_tma=True, tensordesc_idx=tensordesc_idx))
+                tensordesc_idx += 1
             else:
-                annotated_signature.append(KernelArg((s)))
+                annotated_signature.append(KernelArg((sig)))
         return annotated_signature
 
     expanded_signature = _expand_signature(signature.values())
-    arg_annotations = annotate_signature(expanded_signature)
+    arg_annotations = annotate_signature(signature.values())
     flat_signature = []
     for sig in expanded_signature:
         _flatten_signature(sig, flat_signature)
@@ -260,11 +260,7 @@ def make_tensordesc_arg(arg, metadata):
     return [cu_tensor_map, *shape, *strides]
 
 
-def wrap_handle_tensordesc(launcher, signature, tensordesc_meta):
-    has_tensor_desc_arg = any(isinstance(sig, str) and sig.startswith("tensordesc") for sig in signature.values())
-    if not has_tensor_desc_arg:
-        return launcher
-
+def wrap_handle_args(launcher, signature, tensordesc_meta, arg_annotations):
     tensordesc_indices = set(
         [i for i, sig in enumerate(signature.values()) if isinstance(sig, str) and sig.startswith("tensordesc")])
     assert not tensordesc_meta or len(tensordesc_meta) == len(tensordesc_indices)
@@ -272,15 +268,22 @@ def wrap_handle_tensordesc(launcher, signature, tensordesc_meta):
         tensordesc_meta = [None] * len(tensordesc_indices)
 
     def inner(*args):
-        final_args = list(args[:_BASE_ARGS_FORMAT_LEN])
-        tensordesc_idx = 0
-        for i, arg in enumerate(args[_BASE_ARGS_FORMAT_LEN:]):
-            if i in tensordesc_indices:
-                final_args.extend(make_tensordesc_arg(arg, tensordesc_meta[tensordesc_idx]))
-                tensordesc_idx += 1
-            else:
-                final_args.append(arg)
-        return launcher(*final_args)
+        base_args = args[:-1]
+        kernel_args = args[-1]
+
+        def extract_args(annotated_signature, args):
+            count = len(annotated_signature)
+            for i in range(count):
+                sig = annotated_signature[i]
+                if (sig.is_tuple):
+                    yield from extract_args(sig.signature, args[i])
+                elif (sig.is_tma):
+                    yield from make_tensordesc_arg(args[i], tensordesc_meta[sig.tensordesc_idx])
+                elif (not sig.is_constant):
+                    yield args[i]
+
+        kernel_args = list(extract_args(arg_annotations, kernel_args))
+        return launcher(*base_args, kernel_args)
 
     return inner
 
@@ -295,8 +298,8 @@ class CudaLauncher(object):
         tensordesc_meta = getattr(metadata, "tensordesc_meta", None)
 
         self.num_ctas = getattr(metadata, "num_ctas", 1)
-        self.launch = wrap_handle_tensordesc(triton.runtime.driver.active.utils.launch, signature, tensordesc_meta)
         self.kernel_signature, self.arg_annotations = make_signature(signature, tensordesc_meta)
+        self.launch = wrap_handle_args(triton.runtime.driver.active.utils.launch, signature, tensordesc_meta, self.arg_annotations)
         self.global_scratch_size = metadata.global_scratch_size
         self.global_scratch_align = metadata.global_scratch_align
         self.profile_scratch_size = metadata.profile_scratch_size
@@ -319,20 +322,9 @@ class CudaLauncher(object):
         profile_scratch = allocate_scratch(self.profile_scratch_size, self.profile_scratch_align,
                                            _allocation._profile_allocator)
 
-        def extract_args(annotated_signature, args):
-            count = len(annotated_signature)
-            for i in range(count):
-                sig = annotated_signature[i]
-                if (sig.is_tuple):
-                    yield from extract_args(sig.signature, args[i])
-                elif (not sig.is_constant):
-                    yield args[i]
-
-        final_args = list(extract_args(self.arg_annotations, args))
-
         self.launch(gridX, gridY, gridZ, stream, function, self.launch_cooperative_grid, self.launch_pdl,
                     global_scratch, profile_scratch, kernel_metadata, launch_metadata, launch_enter_hook,
-                    launch_exit_hook, self.kernel_signature, final_args)
+                    launch_exit_hook, self.kernel_signature, args)
 
 
 class CudaDriver(GPUDriver):

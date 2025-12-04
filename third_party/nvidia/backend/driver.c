@@ -704,28 +704,18 @@ bool extractFP64(void *ptr, PyObject *obj) {
   return PyErr_Occurred() == NULL;
 }
 
-bool isConstExpr(PyObject *obj) {
-  PyObject *type_repr = PyObject_Repr(obj);
-  if (!type_repr) {
-    Py_DECREF(type_repr);
+// Extract a CUtensorMap descriptor from a python object, and store it to the
+// memory location pointed by ptr.
+bool extractTmaDesc(void* ptr, PyObject *obj) {
+  CUtensorMap* tensor_map = &((PyCUtensorMapObject*)obj)->tensorMap;
+  if (tensor_map == NULL) {
+    PyErr_Format(PyExc_TypeError,
+                 "object must be of type PyCUtensorMap, got %s",
+                 Py_TYPE(obj)->tp_name);
     return false;
   }
-  PyObject *type_str = PyUnicode_AsEncodedString(type_repr, "utf-8", "~E~");
-  if (!type_str) {
-    Py_DECREF(type_repr);
-    Py_DECREF(type_str);
-    return false;
-  }
-  const char *type_bytes = PyBytes_AsString(type_str);
-  if (!type_bytes) {
-    Py_DECREF(type_repr);
-    Py_DECREF(type_str);
-    return false;
-  }
-  bool is_constexpr = (strcmp(type_bytes, "'constexpr'") == 0);
-  Py_DECREF(type_repr);
-  Py_DECREF(type_str);
-  return is_constexpr;
+  *((CUtensorMap*)ptr) = *tensor_map;
+  return true;
 }
 
 typedef bool (*ExtractorFunc)(void *ptr, PyObject *obj);
@@ -792,8 +782,12 @@ Extractor getExtractor(PyObject *type) {
   } else if (strcmp(type_bytes, "'fp64'") == 0) {
     extractor.size = sizeof(uint64_t);
     extractor.extract = extractFP64;
+  } else if (strcmp(type_bytes, "'nvTmaDesc'") == 0) {
+    extractor.size = sizeof(CUtensorMap);
+    extractor.extract = extractTmaDesc;
   } else {
-    fprintf(stderr, "ahhhhhhhhhh what is this?\n");
+    PyErr_Format(PyExc_RuntimeError, "Unknown data type: %R", type_repr);
+    goto cleanup;
   }
 cleanup:
   Py_DECREF(type_repr);
@@ -872,6 +866,9 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
     // * size
     // * function to call.
     Extractor extractor = getExtractor(types_data[i]);
+    if (extractor.extract == NULL) {
+      goto cleanup;
+    }
     PyObject *current_arg = args_data[i];
     params[params_idx] = alloca(extractor.size);
     if (!extractor.extract(params[params_idx++], current_arg)) {
