@@ -828,7 +828,7 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
     return NULL;
   }
 
-  // extract launch metadata
+  // launch entry hook.
   if (launch_enter_hook != Py_None) {
     PyObject *ret = PyObject_CallOneArg(launch_enter_hook, launch_metadata);
     if (!ret)
@@ -836,7 +836,7 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
     Py_DECREF(ret);
   }
 
-  // Extract args.
+  // Set up args for fast access.
   PyObject *fast_kernel_arg_types = PySequence_Fast(
       signature, "Expected kernel_arg_types to be a sequence or iterable");
   if (!fast_kernel_arg_types) {
@@ -848,7 +848,6 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
     Py_DECREF(fast_kernel_arg_types);
     return NULL;
   }
-
   Py_ssize_t num_args = PySequence_Fast_GET_SIZE(fast_kernel_args);
   Py_ssize_t num_types = PySequence_Fast_GET_SIZE(fast_kernel_arg_types);
   if (num_args != num_types) {
@@ -856,6 +855,7 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   }
   PyObject **args_data = PySequence_Fast_ITEMS(fast_kernel_args);
   PyObject **types_data = PySequence_Fast_ITEMS(fast_kernel_arg_types);
+
   // Number of parameters passed to kernel. + 2 for global & profile scratch.
   int num_params = num_args + 2;
   void **params = (void **)alloca(num_params * sizeof(void *));
@@ -894,6 +894,7 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
     goto cleanup;
   }
 
+  // launch exit hook.
   if (launch_exit_hook != Py_None) {
     PyObject *ret = PyObject_CallOneArg(launch_exit_hook, launch_metadata);
     if (!ret)
