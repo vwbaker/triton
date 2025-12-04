@@ -188,7 +188,7 @@ def make_kernel_signature(signature, tensordesc_meta):
 @dataclass(frozen=True)
 class KernelArg:
     signature: Any
-    is_constant: bool = False
+    is_kernel_arg: bool = False
     is_tuple: bool = False
     is_tma: bool = False
     tensordesc_idx: int | None = None
@@ -201,13 +201,13 @@ def annotate_signature(signature):
     annotated_signature = []
     tensordesc_idx = 0
     for sig in signature:
-        if sig == "constexpr":
-            annotated_signature.append(KernelArg(sig, is_constant=True))
-        elif isinstance(sig, tuple):
+        if isinstance(sig, tuple):
             annotated_signature.append((KernelArg(annotate_signature(sig), is_tuple=True)))
         elif isinstance(sig, str) and sig.startswith("tensordesc"):
             annotated_signature.append(KernelArg(sig, is_tma=True, tensordesc_idx=tensordesc_idx))
             tensordesc_idx += 1
+        elif sig != "constexpr":
+            annotated_signature.append(KernelArg(sig, is_kernel_arg=True))
         else:
             annotated_signature.append(KernelArg((sig)))
     return annotated_signature
@@ -279,12 +279,12 @@ def make_launcher(signature, tensordesc_meta):
             count = len(annotated_signature)
             for i in range(count):
                 sig = annotated_signature[i]
-                if (sig.is_tuple):
-                    yield from extract_args(sig.signature, args[i])
+                if (sig.is_kernel_arg):
+                    yield args[i]
                 elif (sig.is_tma):
                     yield from make_tensordesc_arg(args[i], tensordesc_meta[sig.tensordesc_idx])
-                elif (not sig.is_constant):
-                    yield args[i]
+                elif (sig.is_tuple):
+                    yield from extract_args(sig.signature, args[i])
 
         kernel_args = list(extract_args(arg_annotations, kernel_args))
         return triton.runtime.driver.active.utils.launch(*base_args, kernel_signature, kernel_args)
