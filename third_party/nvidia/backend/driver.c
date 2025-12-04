@@ -725,74 +725,127 @@ typedef struct {
   size_t size;
 } Extractor;
 
-Extractor getExtractor(PyObject *type) {
-  Extractor extractor = (Extractor){.extract = NULL, .size = 0};
+typedef enum {
+  EXTRACTOR_UNKOWN_INDEX = 0,
+  // pointers
+  EXTRACTOR_POINTER_INDEX = 1,
+  // ints
+  EXTRACTOR_INT8_INDEX = 2,
+  EXTRACTOR_INT16_INDEX = 3,
+  EXTRACTOR_INT32_INDEX = 4,
+  EXTRACTOR_INT64_INDEX = 5,
+  // uints
+  EXTRACTOR_UINT8_INDEX = 6,
+  EXTRACTOR_UINT16_INDEX = 7,
+  EXTRACTOR_UINT32_INDEX = 8,
+  EXTRACTOR_UINT64_INDEX = 9,
+  // floats
+  EXTRACTOR_FP16_INDEX = 10,
+  EXTRACTOR_BF16_INDEX = 11,
+  EXTRACTOR_FP32_INDEX = 12,
+  EXTRACTOR_FP64_INDEX = 13,
+  // custom
+  EXTRACTOR_NVTMADESC_INDEX = 14,
+  // last entry to have a count
+  EXTRACTOR_TYPE_COUNT
+} ExtractorTypeIndex;
+
+Extractor extraction_map[EXTRACTOR_TYPE_COUNT] = {
+    [EXTRACTOR_UNKOWN_INDEX] = (Extractor){.extract = NULL, .size = 0},
+    [EXTRACTOR_POINTER_INDEX] =
+        (Extractor){.extract = extractPointer, .size = sizeof(CUdeviceptr)},
+    [EXTRACTOR_INT8_INDEX] =
+        (Extractor){.extract = extractI8, .size = sizeof(int8_t)},
+    [EXTRACTOR_INT16_INDEX] =
+        (Extractor){.extract = extractI16, .size = sizeof(int16_t)},
+    [EXTRACTOR_INT32_INDEX] =
+        (Extractor){.extract = extractI32, .size = sizeof(int32_t)},
+    [EXTRACTOR_INT64_INDEX] =
+        (Extractor){.extract = extractI64, .size = sizeof(int64_t)},
+    [EXTRACTOR_UINT8_INDEX] =
+        (Extractor){.extract = extractU8, .size = sizeof(uint8_t)},
+    [EXTRACTOR_UINT16_INDEX] =
+        (Extractor){.extract = extractU16, .size = sizeof(uint16_t)},
+    [EXTRACTOR_UINT32_INDEX] =
+        (Extractor){.extract = extractU32, .size = sizeof(uint32_t)},
+    [EXTRACTOR_UINT64_INDEX] =
+        (Extractor){.extract = extractU64, .size = sizeof(uint64_t)},
+    [EXTRACTOR_FP16_INDEX] =
+        (Extractor){.extract = extractFP16, .size = sizeof(uint16_t)},
+    [EXTRACTOR_BF16_INDEX] =
+        (Extractor){.extract = extractBF16, .size = sizeof(uint16_t)},
+    [EXTRACTOR_FP32_INDEX] =
+        (Extractor){.extract = extractFP32, .size = sizeof(uint32_t)},
+    [EXTRACTOR_FP64_INDEX] =
+        (Extractor){.extract = extractFP64, .size = sizeof(uint64_t)},
+    [EXTRACTOR_NVTMADESC_INDEX] =
+        (Extractor){.extract = extractTmaDesc, .size = sizeof(CUtensorMap)},
+};
+
+Extractor getExtractor(ExtractorTypeIndex index) {
+  if (index > EXTRACTOR_TYPE_COUNT) {
+    return extraction_map[EXTRACTOR_UNKOWN_INDEX];
+  }
+  return extraction_map[index];
+}
+
+ExtractorTypeIndex getExtractorIndex(PyObject *type) {
+  ExtractorTypeIndex index = EXTRACTOR_UNKOWN_INDEX;
   PyObject *type_repr = PyObject_Repr(type);
   if (!type_repr) {
-    goto cleanup;
+    return index;
   }
   PyObject *type_str = PyUnicode_AsEncodedString(type_repr, "utf-8", "~E~");
   if (!type_str) {
-    goto cleanup;
+    Py_DECREF(type_repr);
+    return index;
   }
   const char *type_bytes = PyBytes_AsString(type_str);
   if (!type_bytes) {
     goto cleanup;
   }
+
   // Examples: '*fp32', 'fp32', 'i8', etc.
   if (type_bytes[1] == '*') {
-    extractor.size = sizeof(CUdeviceptr);
-    extractor.extract = extractPointer;
+    index = EXTRACTOR_POINTER_INDEX;
   } else if (strcmp(type_bytes, "'i8'") == 0) {
-    extractor.size = sizeof(int8_t);
-    extractor.extract = extractI8;
+    index = EXTRACTOR_INT8_INDEX;
   } else if (strcmp(type_bytes, "'i16'") == 0) {
-    extractor.size = sizeof(int16_t);
-    extractor.extract = extractI16;
+    index = EXTRACTOR_INT16_INDEX;
   } else if (strcmp(type_bytes, "'i32'") == 0 ||
              strcmp(type_bytes, "'i1'") == 0) {
-    extractor.size = sizeof(int32_t);
-    extractor.extract = extractI32;
+    index = EXTRACTOR_INT32_INDEX;
   } else if (strcmp(type_bytes, "'i64'") == 0) {
-    extractor.size = sizeof(int64_t);
-    extractor.extract = extractI64;
+    index = EXTRACTOR_INT64_INDEX;
   } else if (strcmp(type_bytes, "'u8'") == 0) {
-    extractor.size = sizeof(uint8_t);
-    extractor.extract = extractU8;
+    index = EXTRACTOR_UINT8_INDEX;
   } else if (strcmp(type_bytes, "'u16'") == 0) {
-    extractor.size = sizeof(uint16_t);
-    extractor.extract = extractU16;
+    index = EXTRACTOR_UINT16_INDEX;
   } else if (strcmp(type_bytes, "'u32'") == 0 ||
              strcmp(type_bytes, "'u1'") == 0) {
-    extractor.size = sizeof(uint32_t);
-    extractor.extract = extractU32;
+    index = EXTRACTOR_UINT32_INDEX;
   } else if (strcmp(type_bytes, "'u64'") == 0) {
-    extractor.size = sizeof(uint64_t);
-    extractor.extract = extractU64;
+    index = EXTRACTOR_UINT64_INDEX;
   } else if (strcmp(type_bytes, "'fp16'") == 0) {
-    extractor.size = sizeof(uint16_t);
-    extractor.extract = extractFP16;
+    index = EXTRACTOR_FP16_INDEX;
   } else if (strcmp(type_bytes, "'bf16'") == 0) {
-    extractor.size = sizeof(uint16_t);
-    extractor.extract = extractBF16;
+    index = EXTRACTOR_BF16_INDEX;
   } else if (strcmp(type_bytes, "'fp32'") == 0 ||
              strcmp(type_bytes, "'f32'") == 0) {
-    extractor.size = sizeof(uint32_t);
-    extractor.extract = extractFP32;
+    index = EXTRACTOR_FP32_INDEX;
   } else if (strcmp(type_bytes, "'fp64'") == 0) {
-    extractor.size = sizeof(uint64_t);
-    extractor.extract = extractFP64;
+    index = EXTRACTOR_FP64_INDEX;
   } else if (strcmp(type_bytes, "'nvTmaDesc'") == 0) {
-    extractor.size = sizeof(CUtensorMap);
-    extractor.extract = extractTmaDesc;
+    index = EXTRACTOR_NVTMADESC_INDEX;
   } else {
     PyErr_Format(PyExc_RuntimeError, "Unknown data type: %R", type_repr);
     goto cleanup;
   }
+
 cleanup:
   Py_DECREF(type_repr);
   Py_DECREF(type_str);
-  return extractor;
+  return index;
 }
 
 static PyObject *launchKernel(PyObject *self, PyObject *args) {
@@ -865,7 +918,8 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
     // Get extractor that will send back a struct with
     // * size
     // * function to call.
-    Extractor extractor = getExtractor(types_data[i]);
+    ExtractorTypeIndex extractor_idx = getExtractorIndex(types_data[i]);
+    Extractor extractor = getExtractor(extractor_idx);
     if (extractor.extract == NULL) {
       goto cleanup;
     }
