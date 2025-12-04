@@ -846,6 +846,10 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   Py_ssize_t num_args = PySequence_Fast_GET_SIZE(fast_kernel_args);
   Py_ssize_t num_types = PySequence_Fast_GET_SIZE(fast_kernel_arg_types);
   if (num_args != num_types) {
+    PyErr_Format(
+        PyExc_RuntimeError,
+        "Expected signature and args to be of the same length, got: %d != %d",
+        num_args, num_types);
     goto cleanup;
   }
   PyObject **args_data = PySequence_Fast_ITEMS(fast_kernel_args);
