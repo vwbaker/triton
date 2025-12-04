@@ -299,7 +299,8 @@ class CudaLauncher(object):
 
         self.num_ctas = getattr(metadata, "num_ctas", 1)
         self.kernel_signature, self.arg_annotations = make_signature(signature, tensordesc_meta)
-        self.launch = wrap_handle_args(triton.runtime.driver.active.utils.launch, signature, tensordesc_meta, self.arg_annotations)
+        self.launch = wrap_handle_args(triton.runtime.driver.active.utils.launch, signature, tensordesc_meta,
+                                       self.arg_annotations)
         self.global_scratch_size = metadata.global_scratch_size
         self.global_scratch_align = metadata.global_scratch_align
         self.profile_scratch_size = metadata.profile_scratch_size

@@ -706,15 +706,15 @@ bool extractFP64(void *ptr, PyObject *obj) {
 
 // Extract a CUtensorMap descriptor from a python object, and store it to the
 // memory location pointed by ptr.
-bool extractTmaDesc(void* ptr, PyObject *obj) {
-  CUtensorMap* tensor_map = &((PyCUtensorMapObject*)obj)->tensorMap;
+bool extractTmaDesc(void *ptr, PyObject *obj) {
+  CUtensorMap *tensor_map = &((PyCUtensorMapObject *)obj)->tensorMap;
   if (tensor_map == NULL) {
     PyErr_Format(PyExc_TypeError,
                  "object must be of type PyCUtensorMap, got %s",
                  Py_TYPE(obj)->tp_name);
     return false;
   }
-  *((CUtensorMap*)ptr) = *tensor_map;
+  *((CUtensorMap *)ptr) = *tensor_map;
   return true;
 }
 
