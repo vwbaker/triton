@@ -128,46 +128,47 @@ _BASE_ARGS_FORMAT = "iiiKKppOOOOOO"
 _BASE_ARGS_FORMAT_LEN = len(_BASE_ARGS_FORMAT)
 
 
-def make_kernel_signature(signature, tensordesc_meta):
+def expand_signature(signature, tensordesc_meta):
+    output = []
+    tensordesc_idx = 0
+    # Expand tensor descriptor arguments into either nvTmaDesc, shape and
+    # strides, or base pointer, shape and strides depending on whether the
+    # kernel was lowered to use the nvTmaDesc or not.
+    for sig in signature:
+        if isinstance(sig, str) and sig.startswith("tensordesc"):
+            meta = tensordesc_meta[tensordesc_idx] if tensordesc_meta else None
+            tensordesc_idx += 1
 
-    def _expand_signature(signature):
-        output = []
-        tensordesc_idx = 0
-        # Expand tensor descriptor arguments into either nvTmaDesc, shape and
-        # strides, or base pointer, shape and strides depending on whether the
-        # kernel was lowered to use the nvTmaDesc or not.
-        for sig in signature:
-            if isinstance(sig, str) and sig.startswith("tensordesc"):
-                meta = tensordesc_meta[tensordesc_idx] if tensordesc_meta else None
-                tensordesc_idx += 1
+            match = re.match("tensordesc<([^[>]*)\\[([^]]*)\\]", sig)
+            dtype = match.group(1)
+            shape = match.group(2)
+            ndim = shape.count(",") + 1
 
-                match = re.match("tensordesc<([^[>]*)\\[([^]]*)\\]", sig)
-                dtype = match.group(1)
-                shape = match.group(2)
-                ndim = shape.count(",") + 1
-
-                if meta is None:
-                    output.append("*" + dtype)
-                    # Currently the host side tensor descriptors get passed in as a
-                    # tensor desc, shape, and strides. We have no way to use these
-                    # shape and strides when processing tensor descriptors which is
-                    # why we provide our own decomposition above. Sadly this means
-                    # we have to pass the shape and strides twice.
-                    for _ in range(2 * ndim):
-                        output.append("i64")
-                    output.append("i1")
-                else:
-                    output.append("nvTmaDesc")
-
-                for _ in range(ndim):
-                    output.append("i32")
-                for _ in range(ndim):
+            if meta is None:
+                output.append("*" + dtype)
+                # Currently the host side tensor descriptors get passed in as a
+                # tensor desc, shape, and strides. We have no way to use these
+                # shape and strides when processing tensor descriptors which is
+                # why we provide our own decomposition above. Sadly this means
+                # we have to pass the shape and strides twice.
+                for _ in range(2 * ndim):
                     output.append("i64")
+                output.append("i1")
             else:
-                output.append(sig)
+                output.append("nvTmaDesc")
 
-        assert not tensordesc_meta or tensordesc_idx == len(tensordesc_meta)
-        return output
+            for _ in range(ndim):
+                output.append("i32")
+            for _ in range(ndim):
+                output.append("i64")
+        else:
+            output.append(sig)
+
+    assert not tensordesc_meta or tensordesc_idx == len(tensordesc_meta)
+    return output
+
+
+def make_kernel_signature(signature, tensordesc_meta):
 
     def _flatten_signature(sig, output):
         # Flatten tuples
@@ -177,7 +178,7 @@ def make_kernel_signature(signature, tensordesc_meta):
         else:
             output.append(sig)
 
-    expanded_signature = _expand_signature(signature.values())
+    expanded_signature = expand_signature(signature.values(), tensordesc_meta)
     flat_signature = []
     for sig in expanded_signature:
         _flatten_signature(sig, flat_signature)
@@ -191,8 +192,6 @@ class KernelArg:
     signature: Any
     is_kernel_arg: bool = False
     is_tuple: bool = False
-    is_tma: bool = False
-    tensordesc_idx: int | None = None
 
 
 # This creates a signature with an efficient method to flatten tuples,
@@ -200,13 +199,9 @@ class KernelArg:
 # passing it to the launcher.
 def annotate_signature(signature):
     annotated_signature = []
-    tensordesc_idx = 0
     for sig in signature:
         if isinstance(sig, tuple):
             annotated_signature.append((KernelArg(annotate_signature(sig), is_tuple=True)))
-        elif isinstance(sig, str) and sig.startswith("tensordesc"):
-            annotated_signature.append(KernelArg(sig, is_tma=True, tensordesc_idx=tensordesc_idx))
-            tensordesc_idx += 1
         elif sig != "constexpr":
             annotated_signature.append(KernelArg(sig, is_kernel_arg=True))
         else:
@@ -263,34 +258,41 @@ def make_tensordesc_arg(arg, metadata):
 
 
 def make_launcher(signature, tensordesc_meta):
+    has_tensor_desc_arg = any(isinstance(sig, str) and sig.startswith("tensordesc") for sig in signature.values())
     tensordesc_indices = set(
         [i for i, sig in enumerate(signature.values()) if isinstance(sig, str) and sig.startswith("tensordesc")])
     assert not tensordesc_meta or len(tensordesc_meta) == len(tensordesc_indices)
     if not tensordesc_meta:
         tensordesc_meta = [None] * len(tensordesc_indices)
 
-    arg_annotations = annotate_signature(signature.values())
+    arg_annotations = annotate_signature(expand_signature(signature.values(), tensordesc_meta))
     kernel_signature = make_kernel_signature(signature, tensordesc_meta)
 
     def inner(*args):
         base_args = args[:-1]
         kernel_args = args[-1]
+        return triton.runtime.driver.active.utils.launch(*base_args, arg_annotations, kernel_signature, kernel_args)
 
-        def extract_args(annotated_signature, args):
-            count = len(annotated_signature)
-            for i in range(count):
-                sig = annotated_signature[i]
-                if (sig.is_kernel_arg):
-                    yield args[i]
-                elif (sig.is_tma):
-                    yield from make_tensordesc_arg(args[i], tensordesc_meta[sig.tensordesc_idx])
-                elif (sig.is_tuple):
-                    yield from extract_args(sig.signature, args[i])
+    if not has_tensor_desc_arg:
+        return inner
 
-        kernel_args = list(extract_args(arg_annotations, kernel_args))
-        return triton.runtime.driver.active.utils.launch(*base_args, kernel_signature, kernel_args)
+    def inner_tensor_desc(*args):
+        base_args = args[:-1]
+        kernel_args = args[-1]
 
-    return inner
+        final_kernel_args = []
+        tensordesc_idx = 0
+        for i, arg in enumerate(kernel_args):
+            if i in tensordesc_indices:
+                final_kernel_args.extend(make_tensordesc_arg(arg, tensordesc_meta[tensordesc_idx]))
+                tensordesc_idx += 1
+            else:
+                final_kernel_args.append(arg)
+
+        return triton.runtime.driver.active.utils.launch(*base_args, arg_annotations, kernel_signature,
+                                                         final_kernel_args)
+
+    return inner_tensor_desc
 
 
 class CudaLauncher(object):

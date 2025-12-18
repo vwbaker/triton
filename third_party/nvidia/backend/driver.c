@@ -594,6 +594,9 @@ typedef struct _DevicePtrInfo {
 } DevicePtrInfo;
 
 static PyObject *data_ptr_str = NULL;
+static PyObject *is_kernel_arg_str = NULL;
+static PyObject *is_tuple_str = NULL;
+static PyObject *signature_str = NULL;
 
 // Extract a CUDA device pointer from a pointer-like PyObject obj, and store
 // it to the memory location pointed by ptr.
@@ -905,6 +908,81 @@ cleanup:
   return NULL;
 }
 
+bool extractArgs(PyObject **final_list, int *list_idx, PyObject *kernel_args,
+                 PyObject *arg_annotations) {
+  // Extract arg annotations
+  PyObject *fast_annotations = PySequence_Fast(
+      arg_annotations, "Expected arg_annotations to be a sequence or iterable");
+  if (!fast_annotations) {
+    Py_DECREF(fast_annotations);
+    return false;
+  }
+  Py_ssize_t num_annotations = PySequence_Fast_GET_SIZE(fast_annotations);
+  PyObject **annotations = PySequence_Fast_ITEMS(fast_annotations);
+
+  PyObject *fast_args = PySequence_Fast(
+      kernel_args, "Expected arg_annotations to be a sequence or iterable");
+  if (!fast_args) {
+    Py_DECREF(fast_args);
+    goto cleanup;
+  }
+  PyObject **args = PySequence_Fast_ITEMS(fast_args);
+
+  int final_idx = 0, arg_idx = 0;
+  for (int i = 0; i < num_annotations; ++i) {
+    PyObject *annotation = annotations[i];
+
+    // Process kernel args.
+    PyObject *attr_is_kernel_arg =
+        PyObject_GetAttr(annotation, is_kernel_arg_str);
+    if (attr_is_kernel_arg == NULL) {
+      goto cleanup;
+    }
+    bool is_kernel_arg = attr_is_kernel_arg == Py_True;
+    Py_DECREF(attr_is_kernel_arg);
+    if (is_kernel_arg) {
+      // We want to include this as a kernel arg.
+      final_list[*list_idx] = args[arg_idx++];
+      *list_idx += 1;
+      continue;
+    }
+
+    // Process tuples.
+    PyObject *attr_is_tuple = PyObject_GetAttr(annotation, is_tuple_str);
+    if (attr_is_tuple == NULL) {
+      goto cleanup;
+    }
+    bool is_tuple = attr_is_tuple == Py_True;
+    Py_DECREF(attr_is_tuple);
+    if (is_tuple) {
+      PyObject *tuple_annotation = PyObject_GetAttr(annotation, signature_str);
+      if (tuple_annotation == NULL) {
+        goto cleanup;
+      }
+      bool result =
+          extractArgs(final_list, list_idx, args[arg_idx++], tuple_annotation);
+      Py_DECREF(tuple_annotation);
+      if (!result) {
+        goto cleanup;
+      }
+      continue;
+    }
+
+    // If it's not a kernel arg or a tuple, then we can assume it's a constexpr
+    // and we should skip this arg.
+    arg_idx++;
+  }
+
+  Py_DECREF(fast_annotations);
+  Py_DECREF(fast_args);
+  return true;
+
+cleanup:
+  Py_DECREF(fast_annotations);
+  Py_DECREF(fast_args);
+  return false;
+}
+
 static PyObject *launchKernel(PyObject *self, PyObject *args) {
   // ensure cuda context is valid before calling any CUDA APIs, e.g. before
   // calls to cuPointerGetAttributes
@@ -922,14 +1000,15 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   PyObject *launch_exit_hook = NULL;
   PyObject *global_scratch_obj = NULL;
   PyObject *profile_scratch_obj = NULL;
+  PyObject *arg_annotations = NULL;
   PyObject *signature = NULL;
   PyObject *kernel_args = NULL;
-  if (!PyArg_ParseTuple(args, "iiiKKpp(iii)OOOOOOO", &gridX, &gridY, &gridZ,
+  if (!PyArg_ParseTuple(args, "iiiKKpp(iii)OOOOOOOO", &gridX, &gridY, &gridZ,
                         &_stream, &_function, &launch_cooperative_grid,
                         &launch_pdl, &num_warps, &num_ctas, &shared_memory,
                         &launch_metadata, &launch_enter_hook, &launch_exit_hook,
-                        &global_scratch_obj, &profile_scratch_obj, &signature,
-                        &kernel_args)) {
+                        &global_scratch_obj, &profile_scratch_obj,
+                        &arg_annotations, &signature, &kernel_args)) {
     return NULL;
   }
 
@@ -947,31 +1026,25 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   if (!fast_kernel_arg_types) {
     return NULL;
   }
-  PyObject *fast_kernel_args = PySequence_Fast(
-      kernel_args, "Expected kernel_args to be a sequence or iterable");
-  if (!fast_kernel_args) {
-    Py_DECREF(fast_kernel_arg_types);
-    return NULL;
-  }
-  Py_ssize_t num_args = PySequence_Fast_GET_SIZE(fast_kernel_args);
   Py_ssize_t num_types = PySequence_Fast_GET_SIZE(fast_kernel_arg_types);
-  if (num_args != num_types) {
-    PyErr_Format(
-        PyExc_RuntimeError,
-        "Expected signature and args to be of the same length, got: %d != %d",
-        num_args, num_types);
-    goto cleanup;
-  }
-  PyObject **args_data = PySequence_Fast_ITEMS(fast_kernel_args);
   PyObject **types_data = PySequence_Fast_ITEMS(fast_kernel_arg_types);
 
+  PyObject **args_data = (PyObject **)alloca(num_types * sizeof(PyObject *));
+  if (args_data == NULL) {
+    goto cleanup;
+  }
+  int list_idx = 0;
+  if (!extractArgs(args_data, &list_idx, kernel_args, arg_annotations)) {
+    goto cleanup;
+  }
+
   // Number of parameters passed to kernel. + 2 for global & profile scratch.
-  int num_params = num_args + 2;
+  int num_params = num_types + 2;
   void **params = (void **)alloca(num_params * sizeof(void *));
   int params_idx = 0;
   // This loop has to stay in the same function that owns params, since we are
   // using alloca to allocate pointers to it on the stack of the function.
-  for (Py_ssize_t i = 0; i < num_args; ++i) {
+  for (Py_ssize_t i = 0; i < num_types; ++i) {
     // Get extractor that will send back a struct with
     // * size
     // * function to call.
@@ -1006,17 +1079,18 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   // launch exit hook.
   if (launch_exit_hook != Py_None) {
     PyObject *ret = PyObject_CallOneArg(launch_exit_hook, launch_metadata);
-    if (!ret)
+    if (!ret) {
       goto cleanup;
+    }
     Py_DECREF(ret);
   }
   Py_DECREF(fast_kernel_arg_types);
-  Py_DECREF(fast_kernel_args);
+  // Py_DECREF(fast_kernel_args);
   Py_RETURN_NONE;
 
 cleanup:
   Py_DECREF(fast_kernel_arg_types);
-  Py_DECREF(fast_kernel_args);
+  // Py_DECREF(fast_kernel_args);
   return NULL;
 }
 
@@ -1058,6 +1132,9 @@ PyMODINIT_FUNC PyInit_cuda_utils(void) {
     return NULL;
   }
   data_ptr_str = PyUnicode_InternFromString("data_ptr");
+  is_kernel_arg_str = PyUnicode_InternFromString("is_kernel_arg");
+  is_tuple_str = PyUnicode_InternFromString("is_tuple");
+  signature_str = PyUnicode_InternFromString("signature");
   if (data_ptr_str == NULL) {
     return NULL;
   }
