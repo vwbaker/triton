@@ -180,7 +180,7 @@ def expand_signature(signature, tensordesc_meta):
     return output
 
 
-def make_kernel_signature(signature, tensordesc_meta):
+def make_kernel_signature(signature):
 
     def _flatten_signature(sig, output):
         # Flatten tuples
@@ -190,9 +190,8 @@ def make_kernel_signature(signature, tensordesc_meta):
         else:
             output.append(sig)
 
-    expanded_signature = expand_signature(signature.values(), tensordesc_meta)
     flat_signature = []
-    for sig in expanded_signature:
+    for sig in signature:
         _flatten_signature(sig, flat_signature)
     kernel_signature = [x for x in flat_signature if x != "constexpr"]
 
@@ -209,16 +208,16 @@ class KernelArg:
 # This creates a signature with an efficient method to flatten tuples,
 # remove constexpr, and expand tensor descriptors from the args list before
 # passing it to the launcher.
-def annotate_signature(signature):
-    annotated_signature = []
+def annotate_arguments(signature):
+    annotated_arguments = []
     for sig in signature:
         if isinstance(sig, tuple):
-            annotated_signature.append((PyKernelArg(nested_tuple=annotate_signature(sig), type=ARG_TUPLE)))
+            annotated_arguments.append((PyKernelArg(nested_tuple=annotate_arguments(sig), type=ARG_TUPLE)))
         elif sig != "constexpr":
-            annotated_signature.append(PyKernelArg(nested_tuple=None, type=ARG_KERNEL))
+            annotated_arguments.append(PyKernelArg(nested_tuple=None, type=ARG_KERNEL))
         else:
-            annotated_signature.append(PyKernelArg(nested_tuple=None, type=ARG_CONSTEXPR))
-    return annotated_signature
+            annotated_arguments.append(PyKernelArg(nested_tuple=None, type=ARG_CONSTEXPR))
+    return annotated_arguments
 
 
 # The TMA dtype enum values are slightly different on host vs device...
@@ -269,26 +268,17 @@ def make_tensordesc_arg(arg, metadata):
     return [cu_tensor_map, *shape, *strides]
 
 
-def make_launcher(signature, tensordesc_meta):
+def wrap_handle_tensordesc(launcher, signature, tensordesc_meta):
     has_tensor_desc_arg = any(isinstance(sig, str) and sig.startswith("tensordesc") for sig in signature.values())
+    if not has_tensor_desc_arg:
+        return launcher
     tensordesc_indices = set(
         [i for i, sig in enumerate(signature.values()) if isinstance(sig, str) and sig.startswith("tensordesc")])
     assert not tensordesc_meta or len(tensordesc_meta) == len(tensordesc_indices)
     if not tensordesc_meta:
         tensordesc_meta = [None] * len(tensordesc_indices)
 
-    arg_annotations = annotate_signature(expand_signature(signature.values(), tensordesc_meta))
-    kernel_signature = make_kernel_signature(signature, tensordesc_meta)
-
     def inner(*args):
-        base_args = args[:-1]
-        kernel_args = args[-1]
-        return triton.runtime.driver.active.utils.launch(*base_args, arg_annotations, kernel_signature, kernel_args)
-
-    if not has_tensor_desc_arg:
-        return inner
-
-    def inner_tensor_desc(*args):
         base_args = args[:-1]
         kernel_args = args[-1]
 
@@ -301,10 +291,9 @@ def make_launcher(signature, tensordesc_meta):
             else:
                 final_kernel_args.append(arg)
 
-        return triton.runtime.driver.active.utils.launch(*base_args, arg_annotations, kernel_signature,
-                                                         final_kernel_args)
+        return launcher(*base_args, final_kernel_args)
 
-    return inner_tensor_desc
+    return inner
 
 
 class CudaLauncher(object):
@@ -316,8 +305,12 @@ class CudaLauncher(object):
         signature = {idx: value for idx, value in src.signature.items()}
         tensordesc_meta = getattr(metadata, "tensordesc_meta", None)
 
+        launcher = triton.runtime.driver.active.utils.launch
+        expanded_signature = expand_signature(signature.values(), tensordesc_meta)
+        self.arg_annotations = annotate_arguments(expanded_signature)
+        self.kernel_signature = make_kernel_signature(expanded_signature)
         self.num_ctas = getattr(metadata, "num_ctas", 1)
-        self.launch = make_launcher(signature, tensordesc_meta)
+        self.launch = wrap_handle_tensordesc(launcher, signature, tensordesc_meta)
         self.global_scratch_size = metadata.global_scratch_size
         self.global_scratch_align = metadata.global_scratch_align
         self.profile_scratch_size = metadata.profile_scratch_size
@@ -342,7 +335,7 @@ class CudaLauncher(object):
 
         self.launch(gridX, gridY, gridZ, stream, function, self.launch_cooperative_grid, self.launch_pdl,
                     kernel_metadata, launch_metadata, launch_enter_hook, launch_exit_hook, global_scratch,
-                    profile_scratch, args)
+                    profile_scratch, self.arg_annotations, self.kernel_signature, args)
 
 
 class CudaDriver(GPUDriver):
