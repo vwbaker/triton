@@ -17,6 +17,10 @@ include_dirs = [os.path.join(dirname, "include")]
 libdevice_dir = os.path.join(dirname, "lib")
 libraries = ['libcuda.so.1']
 PyCUtensorMap = None
+PyKernelArg = None
+ARG_CONSTEXPR = None
+ARG_KERNEL = None
+ARG_TUPLE = None
 
 
 @functools.lru_cache()
@@ -69,7 +73,15 @@ class CudaUtils(object):
             libraries=libraries,
         )
         global PyCUtensorMap
+        global PyKernelArg
+        global ARG_CONSTEXPR
+        global ARG_KERNEL
+        global ARG_TUPLE
         PyCUtensorMap = mod.PyCUtensorMap
+        PyKernelArg = mod.PyKernelArg
+        ARG_CONSTEXPR = mod.ARG_CONSTEXPR
+        ARG_KERNEL = mod.ARG_KERNEL
+        ARG_TUPLE = mod.ARG_TUPLE
         self.load_binary = mod.load_binary
         self.get_device_properties = mod.get_device_properties
         self.cuOccupancyMaxActiveClusters = mod.cuOccupancyMaxActiveClusters
@@ -201,11 +213,11 @@ def annotate_signature(signature):
     annotated_signature = []
     for sig in signature:
         if isinstance(sig, tuple):
-            annotated_signature.append((KernelArg(annotate_signature(sig), is_tuple=True)))
+            annotated_signature.append((PyKernelArg(nested_tuple=annotate_signature(sig), type=ARG_TUPLE)))
         elif sig != "constexpr":
-            annotated_signature.append(KernelArg(sig, is_kernel_arg=True))
+            annotated_signature.append(PyKernelArg(nested_tuple=None, type=ARG_KERNEL))
         else:
-            annotated_signature.append(KernelArg((sig)))
+            annotated_signature.append(PyKernelArg(nested_tuple=None, type=ARG_CONSTEXPR))
     return annotated_signature
 
 

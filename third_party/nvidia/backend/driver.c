@@ -1,6 +1,7 @@
 #include "cuda.h"
 #include <dlfcn.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #define PY_SSIZE_T_CLEAN
@@ -10,6 +11,61 @@ typedef struct {
   PyObject_HEAD;
   _Alignas(128) CUtensorMap tensorMap;
 } PyCUtensorMapObject;
+
+typedef enum { ARG_CONSTEXPR = 0, ARG_KERNEL = 1, ARG_TUPLE = 2 } ArgType;
+
+typedef struct {
+  PyObject_HEAD PyObject
+      *nested_tuple; // Can be a List of KernelArgObjects or None
+  ArgType type;
+} PyKernelArgObject;
+
+// Deallocator
+static void PyKernelArg_dealloc(PyKernelArgObject *self) {
+  Py_XDECREF(self->nested_tuple);
+  Py_TYPE(self)->tp_free((PyObject *)self);
+}
+
+// Constructor
+static int PyKernelArg_init(PyKernelArgObject *self, PyObject *args,
+                            PyObject *kwds) {
+  static char *kwlist[] = {"nested_tuple", "type", NULL};
+  PyObject *tup = NULL;
+  int type_val = 0;
+
+  if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|i", kwlist, &tup,
+                                   &type_val)) {
+    return -1;
+  }
+
+  Py_XINCREF(tup);
+  self->nested_tuple = tup;
+  self->type = (ArgType)type_val;
+  return 0;
+}
+
+// Expose members to Python for visibility/debugging
+static PyMemberDef PyKernelArg_members[] = {
+    {"nested_tuple", Py_T_OBJECT_EX, offsetof(PyKernelArgObject, nested_tuple),
+     0, "Nested tuple of more KernelArgs"},
+    {"type", Py_T_INT, offsetof(PyKernelArgObject, type), 0,
+     "ArgType enum value"},
+    {NULL}};
+
+static void PyKernelArg_free(void *ptr) { free(ptr); }
+
+static PyTypeObject PyKernelArgType = {
+    PyVarObject_HEAD_INIT(NULL, 0).tp_name =
+        "triton.backends.nvidia.PyKernelArg",
+    .tp_basicsize = sizeof(PyKernelArgObject),
+    .tp_itemsize = 0,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_doc = "Kernel Argument Metadata",
+    .tp_new = PyType_GenericNew,
+    .tp_init = (initproc)PyKernelArg_init,
+    .tp_dealloc = (destructor)PyKernelArg_dealloc,
+    .tp_members = PyKernelArg_members,
+};
 
 // Raises a Python exception and returns false if code is not CUDA_SUCCESS.
 static bool gpuAssert(CUresult code, const char *file, int line) {
@@ -928,51 +984,25 @@ bool extractArgs(PyObject **final_list, int *list_idx, PyObject *kernel_args,
   }
   PyObject **args = PySequence_Fast_ITEMS(fast_args);
 
-  int final_idx = 0, arg_idx = 0;
+  int arg_idx = 0;
   for (int i = 0; i < num_annotations; ++i) {
-    PyObject *annotation = annotations[i];
-
-    // Process kernel args.
-    PyObject *attr_is_kernel_arg =
-        PyObject_GetAttr(annotation, is_kernel_arg_str);
-    if (attr_is_kernel_arg == NULL) {
-      goto cleanup;
-    }
-    bool is_kernel_arg = attr_is_kernel_arg == Py_True;
-    Py_DECREF(attr_is_kernel_arg);
-    if (is_kernel_arg) {
-      // We want to include this as a kernel arg.
+    PyKernelArgObject *annotation = (PyKernelArgObject *)annotations[i];
+    switch (annotation->type) {
+    case ARG_KERNEL:
       final_list[*list_idx] = args[arg_idx++];
       *list_idx += 1;
-      continue;
-    }
-
-    // Process tuples.
-    PyObject *attr_is_tuple = PyObject_GetAttr(annotation, is_tuple_str);
-    if (attr_is_tuple == NULL) {
-      goto cleanup;
-    }
-    bool is_tuple = attr_is_tuple == Py_True;
-    Py_DECREF(attr_is_tuple);
-    if (is_tuple) {
-      PyObject *tuple_annotation = PyObject_GetAttr(annotation, signature_str);
-      if (tuple_annotation == NULL) {
+      break;
+    case ARG_TUPLE:
+      if (!extractArgs(final_list, list_idx, args[arg_idx++],
+                       annotation->nested_tuple)) {
         goto cleanup;
       }
-      bool result =
-          extractArgs(final_list, list_idx, args[arg_idx++], tuple_annotation);
-      Py_DECREF(tuple_annotation);
-      if (!result) {
-        goto cleanup;
-      }
-      continue;
+      break;
+    case ARG_CONSTEXPR:
+      arg_idx++;
+      break;
     }
-
-    // If it's not a kernel arg or a tuple, then we can assume it's a constexpr
-    // and we should skip this arg.
-    arg_idx++;
   }
-
   Py_DECREF(fast_annotations);
   Py_DECREF(fast_args);
   return true;
@@ -1126,6 +1156,9 @@ PyMODINIT_FUNC PyInit_cuda_utils(void) {
   if (PyType_Ready(&PyCUtensorMapType) < 0) {
     return NULL;
   }
+  if (PyType_Ready(&PyKernelArgType) < 0) {
+    return NULL;
+  }
 
   PyObject *m = PyModule_Create(&ModuleDef);
   if (m == NULL) {
@@ -1140,8 +1173,15 @@ PyMODINIT_FUNC PyInit_cuda_utils(void) {
   }
 
   PyModule_AddFunctions(m, ModuleMethods);
+
   Py_INCREF(&PyCUtensorMapType);
   PyModule_AddObject(m, "PyCUtensorMap", (PyObject *)&PyCUtensorMapType);
+
+  Py_INCREF(&PyKernelArgType);
+  PyModule_AddObject(m, "PyKernelArg", (PyObject *)&PyKernelArgType);
+  PyModule_AddIntConstant(m, "ARG_CONSTEXPR", ARG_CONSTEXPR);
+  PyModule_AddIntConstant(m, "ARG_KERNEL", ARG_KERNEL);
+  PyModule_AddIntConstant(m, "ARG_TUPLE", ARG_TUPLE);
 
   return m;
 }
