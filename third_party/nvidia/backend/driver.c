@@ -828,8 +828,7 @@ Extractor extraction_map[EXTRACTOR_TYPE_COUNT] = {
                                               .name = {"'nvTmaDesc'"}},
 };
 
-Extractor getExtractor(PyObject *obj) {
-  uint8_t index = PyLong_AsLong(obj);
+Extractor getExtractor(uint8_t index) {
   if (index >= EXTRACTOR_TYPE_COUNT) {
     return extraction_map[EXTRACTOR_UNKOWN_INDEX];
   }
@@ -902,34 +901,26 @@ static PyObject *buildSignatureMetadata(PyObject *self, PyObject *args) {
   Py_ssize_t signature_size = PySequence_Fast_GET_SIZE(fast_signature);
   PyObject **signature_items = PySequence_Fast_ITEMS(fast_signature);
 
-  PyObject *signature_list = PyList_New(0);
-  if (signature_list == NULL) {
-    Py_DECREF(fast_signature);
+  PyObject *ret_bytes = PyBytes_FromStringAndSize(NULL, signature_size);
+  if (ret_bytes == NULL) {
+    Py_XDECREF(fast_signature);
     return NULL;
   }
+  char *buffer = PyBytes_AS_STRING(ret_bytes);
   for (Py_ssize_t i = 0; i < signature_size; ++i) {
     ExtractorTypeIndex extractor_idx = getExtractorIndex(signature_items[i]);
     if (extractor_idx == EXTRACTOR_UNKOWN_INDEX) {
       goto cleanup;
     }
-    PyObject *py_index = PyLong_FromLong(extractor_idx);
-    if (py_index == NULL) {
-      goto cleanup;
-    }
-    if (PyList_Append(signature_list, py_index) < 0) {
-      Py_DECREF(py_index);
-      goto cleanup;
-    }
-    Py_DECREF(py_index);
+    buffer[i] = (char)extractor_idx;
   }
 
-  PyObject *ret_bytes = PyBytes_FromObject(signature_list);
-  Py_DECREF(signature_list);
+  Py_XDECREF(fast_signature);
   return ret_bytes;
 
 cleanup:
   Py_XDECREF(fast_signature);
-  Py_XDECREF(signature_list);
+  Py_XDECREF(ret_bytes);
   return NULL;
 }
 
@@ -1000,9 +991,9 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   PyObject *global_scratch_obj = NULL;
   PyObject *profile_scratch_obj = NULL;
   PyObject *arg_annotations = NULL;
-  PyObject *signature = NULL;
+  Py_buffer signature;
   PyObject *kernel_args = NULL;
-  if (!PyArg_ParseTuple(args, "iiiKKpp(iii)OOOOOOOO", &gridX, &gridY, &gridZ,
+  if (!PyArg_ParseTuple(args, "iiiKKpp(iii)OOOOOOy*O", &gridX, &gridY, &gridZ,
                         &_stream, &_function, &launch_cooperative_grid,
                         &launch_pdl, &num_warps, &num_ctas, &shared_memory,
                         &launch_metadata, &launch_enter_hook, &launch_exit_hook,
@@ -1019,16 +1010,11 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
     Py_DECREF(ret);
   }
 
-  // Set up signature for fast access.
-  PyObject *fast_kernel_arg_types = PySequence_Fast(
-      signature, "Expected kernel_arg_types to be a sequence or iterable");
-  if (!fast_kernel_arg_types) {
-    return NULL;
-  }
-  Py_ssize_t num_types = PySequence_Fast_GET_SIZE(fast_kernel_arg_types);
-  PyObject **types_data = PySequence_Fast_ITEMS(fast_kernel_arg_types);
+  uint8_t *extractor_data = (uint8_t *)signature.buf;
+  Py_ssize_t num_args = signature.len;
 
-  PyObject **args_data = (PyObject **)alloca(num_types * sizeof(PyObject *));
+  // Extract kernel parameters - flatten tuples & remove constexpr.
+  PyObject **args_data = (PyObject **)alloca(num_args * sizeof(PyObject *));
   if (args_data == NULL) {
     goto cleanup;
   }
@@ -1038,16 +1024,16 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   }
 
   // Number of parameters passed to kernel. + 2 for global & profile scratch.
-  int num_params = num_types + 2;
+  int num_params = num_args + 2;
   void **params = (void **)alloca(num_params * sizeof(void *));
   int params_idx = 0;
   // This loop has to stay in the same function that owns params, since we are
   // using alloca to allocate pointers to it on the stack of the function.
-  for (Py_ssize_t i = 0; i < num_types; ++i) {
+  for (Py_ssize_t i = 0; i < num_args; ++i) {
     // Get extractor that will send back a struct with
     // * size
     // * function to call.
-    Extractor extractor = getExtractor(types_data[i]);
+    Extractor extractor = getExtractor(extractor_data[i]);
     if (extractor.extract == NULL) {
       goto cleanup;
     }
@@ -1083,13 +1069,11 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
     }
     Py_DECREF(ret);
   }
-  Py_DECREF(fast_kernel_arg_types);
-  // Py_DECREF(fast_kernel_args);
+  PyBuffer_Release(&signature);
   Py_RETURN_NONE;
 
 cleanup:
-  Py_DECREF(fast_kernel_arg_types);
-  // Py_DECREF(fast_kernel_args);
+  PyBuffer_Release(&signature);
   return NULL;
 }
 
