@@ -44,14 +44,6 @@ static int PyKernelArg_init(PyKernelArgObject *self, PyObject *args,
   return 0;
 }
 
-// Expose members to Python for visibility/debugging
-static PyMemberDef PyKernelArg_members[] = {
-    {"nested_tuple", Py_T_OBJECT_EX, offsetof(PyKernelArgObject, nested_tuple),
-     0, "Nested tuple of more KernelArgs"},
-    {"type", Py_T_INT, offsetof(PyKernelArgObject, type), 0,
-     "ArgType enum value"},
-    {NULL}};
-
 static void PyKernelArg_free(void *ptr) { free(ptr); }
 
 static PyTypeObject PyKernelArgType = {
@@ -64,7 +56,6 @@ static PyTypeObject PyKernelArgType = {
     .tp_new = PyType_GenericNew,
     .tp_init = (initproc)PyKernelArg_init,
     .tp_dealloc = (destructor)PyKernelArg_dealloc,
-    .tp_members = PyKernelArg_members,
 };
 
 // Raises a Python exception and returns false if code is not CUDA_SUCCESS.
