@@ -15,8 +15,8 @@ typedef struct {
 typedef enum { ARG_CONSTEXPR = 0, ARG_KERNEL = 1, ARG_TUPLE = 2 } ArgType;
 
 typedef struct {
-  PyObject_HEAD PyObject
-      *nested_tuple; // Can be a List of KernelArgObjects or None
+  PyObject_HEAD;
+  PyObject *nested_tuple; // Can be a List of PyKernelArgObjects or None
   ArgType type;
 } PyKernelArgObject;
 
@@ -227,6 +227,10 @@ typedef CUresult (*cuTensorMapEncodeTiled_t)(
     CUtensorMapSwizzle swizzle, CUtensorMapL2promotion l2Promotion,
     CUtensorMapFloatOOBfill oobFill);
 
+typedef CUresult (*cuLaunchKernelEx_t)(const CUlaunchConfig *config,
+                                       CUfunction f, void **kernelParams,
+                                       void **extra);
+
 #define defineGetFunctionHandle(name, symbolName)                              \
   static symbolName##_t name() {                                               \
     /* Open the shared library */                                              \
@@ -254,6 +258,8 @@ defineGetFunctionHandle(getCuOccupancyMaxActiveClustersHandle,
 
 defineGetFunctionHandle(getCuTensorMapEncodeTiledHandle,
                         cuTensorMapEncodeTiled);
+
+defineGetFunctionHandle(getLaunchKernelExHandle, cuLaunchKernelEx);
 
 static PyObject *occupancyMaxActiveClusters(PyObject *self, PyObject *args) {
   int clusterDim = -1, maxActiveClusters = -1;
@@ -542,31 +548,6 @@ static void ensureCudaContext() {
   }
 }
 
-typedef CUresult (*cuLaunchKernelEx_t)(const CUlaunchConfig *config,
-                                       CUfunction f, void **kernelParams,
-                                       void **extra);
-
-static cuLaunchKernelEx_t getLaunchKernelExHandle() {
-  // Open the shared library
-  void *handle = dlopen("libcuda.so.1", RTLD_LAZY);
-  if (!handle) {
-    PyErr_SetString(PyExc_RuntimeError, "Failed to open libcuda.so.1");
-    return NULL;
-  }
-  // Clear any existing error
-  dlerror();
-  cuLaunchKernelEx_t cuLaunchKernelExHandle =
-      (cuLaunchKernelEx_t)dlsym(handle, "cuLaunchKernelEx");
-  // Check for errors
-  const char *dlsym_error = dlerror();
-  if (dlsym_error) {
-    PyErr_SetString(PyExc_RuntimeError,
-                    "Failed to retrieve cuLaunchKernelEx from libcuda.so.1");
-    return NULL;
-  }
-  return cuLaunchKernelExHandle;
-}
-
 static void _launch(int gridX, int gridY, int gridZ, int num_warps,
                     int num_ctas, int launch_cooperative_grid, int launch_pdl,
                     int shared_memory, CUstream stream, CUfunction function,
@@ -641,9 +622,6 @@ typedef struct _DevicePtrInfo {
 } DevicePtrInfo;
 
 static PyObject *data_ptr_str = NULL;
-static PyObject *is_kernel_arg_str = NULL;
-static PyObject *is_tuple_str = NULL;
-static PyObject *signature_str = NULL;
 
 // Extract a CUDA device pointer from a pointer-like PyObject obj, and store
 // it to the memory location pointed by ptr.
@@ -1041,7 +1019,7 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
     Py_DECREF(ret);
   }
 
-  // Set up args for fast access.
+  // Set up signature for fast access.
   PyObject *fast_kernel_arg_types = PySequence_Fast(
       signature, "Expected kernel_arg_types to be a sequence or iterable");
   if (!fast_kernel_arg_types) {
@@ -1156,9 +1134,6 @@ PyMODINIT_FUNC PyInit_cuda_utils(void) {
     return NULL;
   }
   data_ptr_str = PyUnicode_InternFromString("data_ptr");
-  is_kernel_arg_str = PyUnicode_InternFromString("is_kernel_arg");
-  is_tuple_str = PyUnicode_InternFromString("is_tuple");
-  signature_str = PyUnicode_InternFromString("signature");
   if (data_ptr_str == NULL) {
     return NULL;
   }
