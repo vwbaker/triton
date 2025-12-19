@@ -1,7 +1,6 @@
 #include "cuda.h"
 #include <dlfcn.h>
 #include <stdbool.h>
-#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #define PY_SSIZE_T_CLEAN
@@ -14,6 +13,7 @@ typedef struct {
 
 typedef enum { ARG_CONSTEXPR = 0, ARG_KERNEL = 1, ARG_TUPLE = 2 } ArgType;
 
+// Annotation struct to know how the argument should be handled.
 typedef struct {
   PyObject_HEAD;
   PyObject *nested_tuple; // Can be a List of PyKernelArgObjects or None
@@ -32,12 +32,10 @@ static int PyKernelArg_init(PyKernelArgObject *self, PyObject *args,
   static char *kwlist[] = {"nested_tuple", "type", NULL};
   PyObject *tup = NULL;
   int type_val = 0;
-
   if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|i", kwlist, &tup,
                                    &type_val)) {
     return -1;
   }
-
   Py_XINCREF(tup);
   self->nested_tuple = tup;
   self->type = (ArgType)type_val;
@@ -78,9 +76,10 @@ static bool gpuAssert(CUresult code, const char *file, int line) {
 
 // To be used only *outside* a Py_{BEGIN,END}_ALLOW_THREADS block.
 #define CUDA_CHECK(ans)                                                        \
-  {{gpuAssert((ans), __FILE__, __LINE__);                                      \
-  }                                                                            \
-  }
+  do {                                                                         \
+    if (!gpuAssert((ans), __FILE__, __LINE__))                                 \
+      return;                                                                  \
+  } while (0)
 
 // To be used only *outside* a Py_{BEGIN,END}_ALLOW_THREADS block.
 #define CUDA_CHECK_AND_RETURN_NULL(ans)                                        \
@@ -888,6 +887,9 @@ cleanup:
   return index;
 }
 
+// Takes in a list of types (ex: ['*fp32', 'u8', 'nvTmaDesc']) and returns
+// a bytes array that represent extractors for quick argument extraction
+// when launching.
 static PyObject *buildSignatureMetadata(PyObject *self, PyObject *args) {
   PyObject *signature = NULL;
   if (!PyArg_ParseTuple(args, "O", &signature)) {
@@ -901,6 +903,7 @@ static PyObject *buildSignatureMetadata(PyObject *self, PyObject *args) {
   Py_ssize_t signature_size = PySequence_Fast_GET_SIZE(fast_signature);
   PyObject **signature_items = PySequence_Fast_ITEMS(fast_signature);
 
+  // Create return bytes object.
   PyObject *ret_bytes = PyBytes_FromStringAndSize(NULL, signature_size);
   if (ret_bytes == NULL) {
     Py_XDECREF(fast_signature);
@@ -912,7 +915,7 @@ static PyObject *buildSignatureMetadata(PyObject *self, PyObject *args) {
     if (extractor_idx == EXTRACTOR_UNKOWN_INDEX) {
       goto cleanup;
     }
-    buffer[i] = (char)extractor_idx;
+    buffer[i] = (uint8_t)extractor_idx;
   }
 
   Py_XDECREF(fast_signature);
@@ -937,7 +940,7 @@ bool extractArgs(PyObject **final_list, int *list_idx, PyObject *kernel_args,
   PyObject **annotations = PySequence_Fast_ITEMS(fast_annotations);
 
   PyObject *fast_args = PySequence_Fast(
-      kernel_args, "Expected arg_annotations to be a sequence or iterable");
+      kernel_args, "Expected kernel_args to be a sequence or iterable");
   if (!fast_args) {
     Py_DECREF(fast_args);
     goto cleanup;
@@ -949,8 +952,7 @@ bool extractArgs(PyObject **final_list, int *list_idx, PyObject *kernel_args,
     PyKernelArgObject *annotation = (PyKernelArgObject *)annotations[i];
     switch (annotation->type) {
     case ARG_KERNEL:
-      final_list[*list_idx] = args[arg_idx++];
-      *list_idx += 1;
+      final_list[(*list_idx)++] = args[arg_idx++];
       break;
     case ARG_TUPLE:
       if (!extractArgs(final_list, list_idx, args[arg_idx++],
@@ -971,6 +973,17 @@ cleanup:
   Py_DECREF(fast_annotations);
   Py_DECREF(fast_args);
   return false;
+}
+
+bool launchHook(PyObject *hook, PyObject *metadata) {
+  if (hook != Py_None) {
+    PyObject *ret = PyObject_CallOneArg(hook, metadata);
+    if (!ret) {
+      return false;
+    }
+    Py_DECREF(ret);
+  }
+  return true;
 }
 
 static PyObject *launchKernel(PyObject *self, PyObject *args) {
@@ -1003,11 +1016,8 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   }
 
   // launch entry hook.
-  if (launch_enter_hook != Py_None) {
-    PyObject *ret = PyObject_CallOneArg(launch_enter_hook, launch_metadata);
-    if (!ret)
-      return NULL;
-    Py_DECREF(ret);
+  if (!launchHook(launch_enter_hook, launch_metadata)) {
+    goto cleanup;
   }
 
   uint8_t *extractor_data = (uint8_t *)signature.buf;
@@ -1031,8 +1041,8 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   // using alloca to allocate pointers to it on the stack of the function.
   for (Py_ssize_t i = 0; i < num_args; ++i) {
     // Get extractor that will send back a struct with
-    // * size
-    // * function to call.
+    // * size for allocation
+    // * function to call to put the parameter in params buffer
     Extractor extractor = getExtractor(extractor_data[i]);
     if (extractor.extract == NULL) {
       goto cleanup;
@@ -1043,6 +1053,7 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
       goto cleanup;
     }
   }
+  // Add scratch objects.
   params[params_idx] = alloca(sizeof(void *));
   if (!extractPointer(params[params_idx++], global_scratch_obj)) {
     goto cleanup;
@@ -1061,13 +1072,8 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
     goto cleanup;
   }
 
-  // launch exit hook.
-  if (launch_exit_hook != Py_None) {
-    PyObject *ret = PyObject_CallOneArg(launch_exit_hook, launch_metadata);
-    if (!ret) {
-      goto cleanup;
-    }
-    Py_DECREF(ret);
+  if (!launchHook(launch_exit_hook, launch_metadata)) {
+    goto cleanup;
   }
   PyBuffer_Release(&signature);
   Py_RETURN_NONE;
@@ -1093,7 +1099,7 @@ static PyMethodDef ModuleMethods[] = {
     {"fill_tma_descriptor", fillTMADescriptor, METH_VARARGS, "doc"},
     {"build_signature_metadata", buildSignatureMetadata, METH_VARARGS,
      "Calling it with a signature list (ex: ['*fp32', 'u8', 'nvTmaDesc']), "
-     "will return metadata to be passed into 'launchKernel' for quicker "
+     "will return metadata to be passed into 'launch' for quicker "
      "argument parsing."},
     {"launch", launchKernel, METH_VARARGS, "launches cuda kernel"},
 
